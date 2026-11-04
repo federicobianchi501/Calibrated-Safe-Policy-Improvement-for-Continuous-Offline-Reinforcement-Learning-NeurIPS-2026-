@@ -35,10 +35,6 @@ at the top of each launcher, e.g.:
 DATASET_SIZES_OVERRIDE="500" SEEDS_OVERRIDE="0" MAX_JOBS=1 bash run_benchmark_hopper.sh
 ```
 
-The default planner backend is `array` (compiled). The reference
-implementation is available with `MCTS_BACKEND=original` (`parametric` on
-Point Maze).
-
 ## Citation
 
 ```bibtex
