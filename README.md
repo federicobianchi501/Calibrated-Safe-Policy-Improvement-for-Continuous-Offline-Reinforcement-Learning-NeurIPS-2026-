@@ -38,7 +38,7 @@ DATASET_SIZES_OVERRIDE="500" SEEDS_OVERRIDE="0" MAX_JOBS=1 bash run_benchmark_ho
 ## Citation
 
 ```bibtex
-@inproceedings{bianchi2026calibrated,
+@inproceedings{bianchi2026CalSPI,
   title     = {Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning},
   author    = {Bianchi, Federico and Farinelli, Alessandro and Castellini, Alberto},
   booktitle = {The Fortieth Annual Conference on Neural Information Processing Systems (NeurIPS 2026)},
