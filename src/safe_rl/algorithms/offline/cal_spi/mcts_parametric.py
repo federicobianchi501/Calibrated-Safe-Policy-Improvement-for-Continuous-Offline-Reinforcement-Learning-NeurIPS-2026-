@@ -1,15 +1,17 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
 """
-Offline MCTS-DPW planner guided by a PPO baseline, with calibrated or
-uncertainty-based safe gating.
+Reference MCTS-DPW planner over a learned ensemble model, guided by a PPO baseline.
 
-Actions are always clipped to [-1, 1] before (i) computing the uncertainty
-score and the safe gate, and (ii) stepping the learned model env. This
-keeps the gate consistent with the dynamics (which clip internally) and
-with the in-range action distribution seen in the dataset.
+Provides the planner configuration, the tree node, the PPO-guided planner with a
+calibrated (B(u) <= eps) or raw-uncertainty (u <= tau) gate and fallback to the
+baseline action, and an ungated, prior-free planner used as an unprotected baseline.
+
+Actions are clipped to [-1, 1] before computing the uncertainty score and the gate
+and before stepping the model env, so the gate sees the same action as the dynamics.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ import numpy as np
 
 @dataclass
 class OfflineMCTSConfig:
+    """Planner hyperparameters shared by all MCTS-DPW variants."""
+
     # MCTS/DPW
     num_sims: int = 200
     max_depth: int = 20
@@ -45,13 +49,15 @@ class OfflineMCTSConfig:
     uncertainty_threshold: float = 1.0   # τ for uncertainty gate u <= τ
     eps_threshold: float = 0.10          # ε for calibrated gate B(u) <= ε
     conservative_on_low_data: bool = True
-    suppress_unsafe_actions: bool = False  # if True, set P[a]=0 for unsafe actions inside the tree
+    suppress_unsafe_actions: bool = False  # set P[a] = 0 for unsafe actions inside the tree
 
     # Model sampling
     model_sampling: str = "fixed_per_sim"  # "fixed_per_sim" | "resample_each_step"
 
 
 class Node:
+    """Search-tree node with per-edge action, prior, mean return, visit count and child."""
+
     __slots__ = ("obs", "depth", "N", "actions", "children", "P", "Q", "Nsa")
 
     def __init__(self, obs: Dict[str, np.ndarray], depth: int):
@@ -66,6 +72,19 @@ class Node:
 
 
 class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
+    """MCTS-DPW planner with PPO prior, safe gate and baseline fallback at the root.
+
+    Root candidates are the PPO mean plus actions sampled from N(a_b(s), sigma^2 I).
+    With ``gate_inside_tree``, an unsafe edge ends the simulation with the leaf value
+    of its node. At the root the best safe action by Q is returned (ties broken by
+    visit count); if no root action is safe, the PPO mean is returned. In the low-data
+    regime with ``conservative_on_low_data`` the planner returns the PPO mean without
+    searching (conservative collapse).
+
+    After each ``act`` call, ``last_root_fallback`` and ``last_root_coverage`` (fraction
+    of safe root actions) are set for evaluation logging.
+    """
+
     def __init__(
         self,
         model_env: Any,
@@ -86,53 +105,53 @@ class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
         self.use_ppo_leaf_value = bool(use_ppo_leaf_value)
         self.rng = np.random.default_rng(int(rng_seed))
 
-        # logging for evaluation
+        # Evaluation logging.
         self.last_root_fallback: bool = False
         self.last_root_coverage: float = 0.0
         self._debug_once = False
-        # # --- DEBUG ROOT SELECTION ---
-        # self._dbg_steps = 0
-        # self._dbg_chose_ppo = 0
-        # self._dbg_dist_sum = 0.0
 
     # ---------- PPO helpers ----------
     def _ppo_mean(self, obs: Dict[str, np.ndarray]) -> np.ndarray:
+        """Deterministic PPO action a_b(s) as a flat float32 vector."""
         a, _ = self.ppo.predict(obs, deterministic=True)
         return np.asarray(a, dtype=np.float32).reshape(-1)
 
     def _sample_ppo(self, obs: Dict[str, np.ndarray], n: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Sample n actions from N(a_b(s), sigma^2 I), clipped to [-1, 1].
+
+        Returns ``(actions, priors)``; priors are Gaussian weights in the distance to
+        the PPO mean, normalised to sum to one, and are used as P in PUCT.
         """
-        Sample n actions around PPO mean. Returns (actions, priors).
-        priors are soft weights used in PUCT as P.
-        """
-    
+
         mean = self._clip_action(self._ppo_mean(obs))
         act_dim = int(mean.shape[0])
 
         std = float(self.cfg.ppo_std_scale)
         acts = mean[None, :] + std * self.rng.standard_normal(size=(n, act_dim)).astype(np.float32)
 
-        # IMPORTANT: clip here so actions stored in the tree are valid.
+        # Clip before storing so every tree action is in range.
         acts = np.clip(acts, -1.0, 1.0).astype(np.float32)
 
-        # priors: higher near mean (computed after clip for consistency)
+        # Priors are computed on the clipped actions.
         d = np.linalg.norm(acts - mean[None, :], axis=-1)
         priors = np.exp(-0.5 * (d ** 2) / max(1e-6, std ** 2)).astype(np.float32)
         priors = priors / (priors.sum() + 1e-8)
         return acts, priors
 
     def _clip_action(self, action: np.ndarray) -> np.ndarray:
-        """
-        Clip actions to the env's valid range (assumed [-1, 1]).
+        """Clip an action to [-1, 1].
 
-        IMPORTANT: the model env clips internally, but uncertainty is computed
-        on the (obs, action) pair. Clipping here keeps gating consistent
-        with the dynamics and with the training data distribution.
+        The model env clips internally; clipping before the uncertainty query keeps
+        the gate evaluated on the same action the dynamics receive.
         """
         a = np.asarray(action, dtype=np.float32).reshape(-1)
         return np.clip(a, -1.0, 1.0).astype(np.float32)
 
     def _leaf_value(self, obs: Dict[str, np.ndarray]) -> float:
+        """PPO value estimate V_b(s), or 0 when PPO leaf values are disabled or unavailable.
+
+        Used for empty nodes and gated edges; the max-depth cutoff always returns 0.
+        """
         if (not self.use_ppo_leaf_value) or (str(self.cfg.leaf_value_mode) == "zero"):
             return 0.0
         try:
@@ -146,7 +165,7 @@ class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
 
     # ---------- Ensemble access ----------
     def _get_ensemble(self) -> Optional[Any]:
-        # robust: accept both model_env.ensemble and model_env.ens
+        """Return the dynamics ensemble (``model_env.ensemble`` or ``model_env.ens``)."""
         if hasattr(self.model_env, "ensemble"):
             return getattr(self.model_env, "ensemble")
         if hasattr(self.model_env, "ens"):
@@ -155,6 +174,7 @@ class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
 
     # ---------- Uncertainty ----------
     def _uncertainty_raw(self, obs: Dict[str, np.ndarray], action: np.ndarray) -> float:
+        """Uncertainty score u(s, a) of type ``cfg.uncertainty_type``; 0 without an ensemble."""
         ens = self._get_ensemble()
         if ens is None:
             return 0.0
@@ -171,10 +191,14 @@ class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
         raise ValueError(f"Unknown uncertainty_type={ut}")
 
     def _is_safe(self, obs: Dict[str, np.ndarray], action: np.ndarray) -> Tuple[bool, float, Optional[float]]:
-        """
-        Returns: (safe, u, bound)
-        - gate_mode="uncertainty": safe iff u <= τ, bound=None
-        - gate_mode="calibrated": safe iff B(u) <= ε, bound=B(u)
+        """Evaluate the gate on (s, a).
+
+        Returns ``(safe, u, bound)``:
+          - gate disabled: always safe, bound None;
+          - ``gate_mode="uncertainty"``: safe iff u <= tau, bound None;
+          - ``gate_mode="calibrated"``: safe iff B(u) <= eps, bound B(u). In the low-data
+            regime (with ``conservative_on_low_data``) or for a non-finite bound, the
+            action is unsafe and bound is inf.
         """
         action = self._clip_action(action)
         u = self._uncertainty_raw(obs, action)
@@ -205,10 +229,10 @@ class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
 
     # ---------- MCTS core ----------
     def act(self, obs: Dict[str, np.ndarray]) -> np.ndarray:
-        # --- Hard conservative mode: if B(u) is not constructible, skip planning entirely
+        """Plan from ``obs`` and return the selected action (PPO mean on fallback)."""
+        # Low-data regime: B(u) is not constructible, return the baseline without searching.
         if bool(self.cfg.conservative_on_low_data) and bool(getattr(self, "calibrator", None) is not None) \
         and bool(getattr(self.calibrator, "meta", {}).get("low_data_regime", False)):
-            # metrics: coverage=0, fallback=True
             self.last_root_coverage = 0.0
             self.last_root_fallback = True
             return self._clip_action(self._ppo_mean(obs))
@@ -226,7 +250,8 @@ class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
         except Exception:
             a_ppo = None
 
-        # choose model index per simulation if fixed_per_sim
+        # fixed_per_sim (TS-inf): one ensemble member per simulation, all indices drawn
+        # up front, before any action sampling.
         model_indices = None
         ens = self._get_ensemble()
         if ens is not None and str(self.cfg.model_sampling) == "fixed_per_sim":
@@ -239,7 +264,7 @@ class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
                 mi = int(model_indices[s])
             self._search(root, mi=mi)
 
-        # Root selection with safe filtering (fallback to PPO mean if none safe)
+        # Restrict root selection to safe actions; fall back to the PPO mean if none.
         safe_ids: List[int] = []
         for i, a in enumerate(root.actions):
             safe, _, _ = self._is_safe(root.obs, a)
@@ -254,7 +279,7 @@ class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
 
         self.last_root_fallback = False
         tol = 1e-9
-        # stable selection: maximize Q, break ties (within tol) by Nsa
+        # Maximise Q; ties within tol are broken by visit count.
         q_best = max(root.Q[j] for j in safe_ids)
         cands = [j for j in safe_ids if (q_best - root.Q[j]) <= tol]
         best_i = max(cands, key=lambda j: root.Nsa[j])
@@ -262,9 +287,9 @@ class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
         return np.asarray(root.actions[best_i], dtype=np.float32)
 
     def _expand_action(self, node: Node, n_actions: int) -> None:
+        """Append ``n_actions`` PPO-sampled (already clipped) actions to ``node``."""
         acts, priors = self._sample_ppo(node.obs, n_actions)
         for a, p in zip(acts, priors):
-            # a already clipped in _sample_ppo
             node.actions.append(np.asarray(a, dtype=np.float32).reshape(-1))
             node.P.append(float(p))
             node.Q.append(0.0)
@@ -272,7 +297,7 @@ class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
             node.children.append(None)
 
     def _select_child(self, node: Node) -> int:
-        # PUCT with per-edge counts
+        """PUCT selection: argmax_i Q[i] + c_puct * P[i] * sqrt(N) / max(1, Nsa[i])."""
         N = float(max(1, node.N))
         best_i = -1
         best_score = -1e30
@@ -288,12 +313,17 @@ class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
         return int(best_i)
 
     def _search(self, node: Node, mi: Optional[int]) -> float:
+        """Run one simulation below ``node`` with ensemble member ``mi``; return its return.
+
+        The value at ``max_depth`` is 0, not the PPO value.
+        """
         node.N += 1
 
         if node.depth >= int(self.cfg.max_depth):
             return 0.0
 
-        # Progressive widening
+        # Action progressive widening: |A(s)| <= min(floor(k * N^alpha), cap), at most
+        # 8 new actions per visit.
         max_children = int(float(self.cfg.dpw_k) * (float(node.N) ** float(self.cfg.dpw_alpha)))
         cap = int(self.cfg.n_actions_root) if node.depth == 0 else int(self.cfg.n_actions_per_node)
         target = min(max_children, cap)
@@ -310,10 +340,10 @@ class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
         if a_idx < 0:
             return self._leaf_value(node.obs)
 
-        # ensure clipped action consistently used everywhere
         a = self._clip_action(node.actions[a_idx])
         node.actions[a_idx] = a
 
+        # Unsafe edge inside the tree: back up the leaf value and stop the simulation.
         safe, _, _ = self._is_safe(node.obs, a)
         if self.use_gate and bool(self.cfg.gate_inside_tree) and (not safe):
             v = self._leaf_value(node.obs)
@@ -352,22 +382,16 @@ class OfflineMCTS_DPW_PPO_SPIBB_Parametric:
         return float(G)
 
 # =============================================================================
-# TOTAL UNSAFE: pure model-based MCTS-DPW (ensemble) with NO gate and NO PPO
+# Unprotected baseline: model-based MCTS-DPW without gate and without PPO
 # =============================================================================
 
 class OfflineMCTS_DPW_Ensemble_UNSAFE:
-    """
-    Pure MCTS-DPW on the learned model-env (ensemble), intended as an UNSAFE baseline.
+    """MCTS-DPW on the learned ensemble model with no gate and no baseline.
 
-    Properties:
-      - No safety gate (no uncertainty thresholding, no calibrated bound)
-      - No PPO prior (uniform action sampling)
-      - No PPO value (leaf value always 0)
-      - No PPO fallback at root (always returns best-Q action among expanded actions)
-      - Uses ensemble/model sampling via model_env.step(..., model_index=...)
-
-    This is the baseline that should typically collapse below PPO for small datasets,
-    because it can exploit model bias / OOD hallucinations without constraints.
+    Actions are sampled uniformly in [action_low, action_high] with uniform priors,
+    leaf values are 0, and the root returns the best-Q expanded action with no
+    fallback. Model sampling follows ``cfg.model_sampling`` as in the gated planner.
+    Unconstrained, it can exploit model errors outside the data support.
     """
 
     def __init__(
@@ -390,11 +414,13 @@ class OfflineMCTS_DPW_Ensemble_UNSAFE:
         self.action_high = high
         self.act_dim = int(low.shape[0])
 
-        # logging for evaluation (same interface as the PPO-guided planner)
-        self.last_root_fallback: bool = False   # never used here
-        self.last_root_coverage: float = 1.0    # always "all actions" since no gate
+        # Same logging interface as the gated planner; no gate, so never a fallback
+        # and coverage is always 1.
+        self.last_root_fallback: bool = False
+        self.last_root_coverage: float = 1.0
 
     def _get_ensemble(self) -> Optional[Any]:
+        """Return the dynamics ensemble (``model_env.ensemble`` or ``model_env.ens``)."""
         if hasattr(self.model_env, "ensemble"):
             return getattr(self.model_env, "ensemble")
         if hasattr(self.model_env, "ens"):
@@ -402,22 +428,26 @@ class OfflineMCTS_DPW_Ensemble_UNSAFE:
         return None
 
     def _clip_action(self, action: np.ndarray) -> np.ndarray:
+        """Clip an action to [action_low, action_high]."""
         a = np.asarray(action, dtype=np.float32).reshape(-1)
         return np.clip(a, self.action_low, self.action_high).astype(np.float32)
 
     def _sample_uniform_actions(self, n: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Sample n uniform actions; returns ``(actions, uniform priors)``."""
         n = int(n)
         acts = self.rng.uniform(low=self.action_low, high=self.action_high, size=(n, self.act_dim)).astype(np.float32)
         pri = np.full((n,), 1.0 / max(1, n), dtype=np.float32)
         return acts, pri
 
     def _leaf_value(self, _obs: Dict[str, np.ndarray]) -> float:
+        """Leaf value, always 0."""
         return 0.0
 
     def act(self, obs: Dict[str, np.ndarray]) -> np.ndarray:
+        """Plan from ``obs`` and return the best-Q root action."""
         root = Node(obs=obs, depth=0)
 
-        # choose model index per simulation if fixed_per_sim
+        # fixed_per_sim: one ensemble member per simulation, drawn up front.
         model_indices = None
         ens = self._get_ensemble()
         if ens is not None and str(self.cfg.model_sampling) == "fixed_per_sim":
@@ -430,8 +460,7 @@ class OfflineMCTS_DPW_Ensemble_UNSAFE:
                 mi = int(model_indices[s])
             self._search(root, mi=mi)
 
-        # No gate, no safe filtering, no PPO fallback:
-        # return argmax Q among expanded actions. If no actions, return random uniform action.
+        # argmax Q over expanded root actions; a uniform action if the root is empty.
         if len(root.actions) == 0:
             a = self._sample_uniform_actions(1)[0][0]
             self.last_root_fallback = False
@@ -444,6 +473,7 @@ class OfflineMCTS_DPW_Ensemble_UNSAFE:
         return np.asarray(root.actions[best_i], dtype=np.float32)
 
     def _expand_action(self, node: Node, n_actions: int) -> None:
+        """Append ``n_actions`` uniformly sampled actions to ``node``."""
         acts, priors = self._sample_uniform_actions(n_actions)
         for a, p in zip(acts, priors):
             a = self._clip_action(a)
@@ -454,6 +484,7 @@ class OfflineMCTS_DPW_Ensemble_UNSAFE:
             node.children.append(None)
 
     def _select_child(self, node: Node) -> int:
+        """PUCT selection, as in the gated planner."""
         N = float(max(1, node.N))
         best_i = -1
         best_score = -1e30
@@ -467,6 +498,7 @@ class OfflineMCTS_DPW_Ensemble_UNSAFE:
         return int(best_i)
 
     def _search(self, node: Node, mi: Optional[int]) -> float:
+        """Run one simulation below ``node`` with ensemble member ``mi``; return its return."""
         node.N += 1
 
         if node.depth >= int(self.cfg.max_depth):

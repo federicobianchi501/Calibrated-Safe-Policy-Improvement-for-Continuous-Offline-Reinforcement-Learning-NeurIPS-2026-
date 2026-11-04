@@ -1,7 +1,9 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
+"""Episode-level summary statistics: mean/std, percentiles, CVaR, success and fallback rates."""
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any
@@ -9,6 +11,7 @@ import numpy as np
 
 
 def cvar(x: np.ndarray, alpha: float = 0.15) -> float:
+    """Lower-tail CVaR: mean of the ceil(alpha * n) smallest values (at least one)."""
     v = np.sort(np.asarray(x, dtype=np.float64).ravel())
     if v.size == 0:
         return float("nan")
@@ -17,6 +20,7 @@ def cvar(x: np.ndarray, alpha: float = 0.15) -> float:
 
 
 def percentile(x: np.ndarray, p: float) -> float:
+    """NumPy percentile of a flattened array; NaN for empty input."""
     x = np.asarray(x, dtype=np.float64).ravel()
     if x.size == 0:
         return float("nan")
@@ -25,6 +29,13 @@ def percentile(x: np.ndarray, p: float) -> float:
 
 @dataclass
 class SummaryStats:
+    """Aggregated metrics over a set of evaluation episodes.
+
+    `fallback_mean_pct` is in percent; `lot_decision_mean` and `lot_env_mean` are means of
+    the per-episode step counts passed to `summarize_episodes`, measured in decision steps
+    and environment steps. Optional fields are NaN when not provided.
+    """
+
     return_mean: float
     return_std: float
     return_p50: float
@@ -40,6 +51,7 @@ class SummaryStats:
     lot_env_mean: float = float("nan")
 
     def to_dict(self) -> Dict[str, Any]:
+        """Return the fields as a plain dict."""
         return asdict(self)
 
 
@@ -52,6 +64,11 @@ def summarize_episodes(
     lot_decision_steps: Optional[np.ndarray] = None,
     lot_env_steps: Optional[np.ndarray] = None,
 ) -> SummaryStats:
+    """Summarize per-episode arrays into a SummaryStats.
+
+    `success` defaults to all zeros; `fallback_rate` is a per-episode fraction in [0, 1]
+    and is reported as a percentage. CVaR uses alpha = 0.15.
+    """
     rets = np.asarray(returns, dtype=np.float64).ravel()
 
     if success is None:

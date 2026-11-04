@@ -1,25 +1,19 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-"""
-cql.py — Conservative Q-Learning (Kumar et al., NeurIPS 2020)
-arXiv:2006.04779
+"""Conservative Q-Learning (Kumar et al., NeurIPS 2020, arXiv:2006.04779).
 
-CQL adds a conservative regularization to the standard SAC objective:
-  Q_loss += α_cql * (logsumexp_{a~π,a~unif} Q(s,a) - Q(s, a_data))
+SAC with the CQL(H) regularizer on both Q heads:
+    Q_loss += alpha_cql * (logsumexp_{a ~ pi, a ~ U[-1,1]} Q(s, a) - Q(s, a_data)).
 
-This prevents Q-overestimation for OOD actions while using the dataset to
-ground Q-values for in-distribution (s,a) pairs.
+    agent = CQLAgent(obs_dim, act_dim, cfg)
+    agent.train(dataset, n_epochs=200)
+    action = agent.act(obs)
 
-Interface (identical to IQL/TD3+BC):
-  agent = CQLAgent(obs_dim, act_dim, cfg)
-  agent.train(dataset, n_epochs=200)
-  action = agent.act(obs_dict)
-
-Hyperparameters follow the original paper:
-  AntMaze / PointMaze (Table 3): alpha_cql=5.0, alpha_sac=0.1
-  Locomotion — Hopper, Walker2d (Table 1): alpha_cql=5.0, alpha_sac=0.05
+Defaults: alpha_cql=5.0, alpha_sac=0.1 (maze domains); the original paper uses
+alpha_sac=0.05 on locomotion.
 """
 from __future__ import annotations
 
@@ -43,7 +37,8 @@ LOG_STD_MAX = 2.0
 
 @dataclass
 class CQLConfig:
-    # Architecture (paper: 3 hidden layers, 256 units for all domains)
+    """CQL hyperparameters."""
+
     hidden_dim: int = 256
     n_hidden:   int = 3
 
@@ -51,20 +46,17 @@ class CQLConfig:
     lr:         float = 3e-4
     batch_size: int   = 256
     gamma:      float = 0.99
-    tau:        float = 0.005       # soft target-update coefficient
+    tau:        float = 0.005       # Polyak coefficient for the target Q network
 
-    # SAC temperature (fixed; auto-tuning not needed for offline RL)
-    # AntMaze/PointMaze: 0.1 (Table 3); Locomotion: 0.05 (Table 1)
+    # Fixed SAC temperature (no automatic tuning).
     alpha_sac:  float = 0.1
 
-    # CQL conservative coefficient
-    # Paper: α=5.0 for AntMaze and locomotion (Tables 1 & 3)
+    # Weight of the conservative term.
     alpha_cql:  float = 5.0
 
-    # Number of action samples for logsumexp estimation (paper: 10)
+    # Samples per state, for each of the policy and uniform proposals.
     n_action_samples: int = 10
 
-    # State normalization (paper: normalize_states=True for all domains)
     normalize_states: bool = True
 
     device: str = "cpu"
@@ -98,16 +90,16 @@ class DoubleQNetwork(nn.Module):
         return self.q1(sa).squeeze(-1), self.q2(sa).squeeze(-1)
 
     def min(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """Elementwise min of the two Q heads."""
         q1, q2 = self.forward(s, a)
         return torch.min(q1, q2)
 
 
 class GaussianActor(nn.Module):
-    """
-    Stochastic Gaussian actor with tanh squashing (SAC-style).
+    """Tanh-squashed Gaussian actor (SAC).
 
-    Outputs mean and log_std from shared trunk; log_prob accounts for the
-    tanh change-of-variables (Appendix C of Haarnoja et al. 2018).
+    Mean and log_std heads share a trunk; log_prob includes the tanh
+    change-of-variables correction (Haarnoja et al., 2018).
     """
     def __init__(self, state_dim: int, act_dim: int,
                  hidden_dim: int, n_hidden: int):
@@ -129,17 +121,14 @@ class GaussianActor(nn.Module):
         eps = torch.randn_like(mean)
         x   = mean + std * eps
         a   = torch.tanh(x)
-        # log_prob with tanh Jacobian correction (sum over action dims)
+        # Tanh Jacobian correction, summed over action dims.
         log_pi = (Normal(mean, std).log_prob(x)
                   - torch.log(1.0 - a.pow(2) + 1e-6)).sum(-1)
         return a, log_pi
 
     def sample_n(self, s: torch.Tensor, n: int
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Sample n actions for each state in s.
-        Returns actions [B, n, act_dim] and log_probs [B, n].
-        """
+        """Sample n actions per state: actions [B, n, act_dim], log_probs [B, n]."""
         B = s.shape[0]
         s_rep = s.unsqueeze(1).expand(-1, n, -1).reshape(B * n, -1)
         a, lp = self.sample(s_rep)
@@ -147,7 +136,7 @@ class GaussianActor(nn.Module):
 
     @torch.no_grad()
     def mean_action(self, s: torch.Tensor) -> torch.Tensor:
-        """Deterministic mean action for evaluation."""
+        """tanh(mean), used at evaluation."""
         mean, _ = self._dist(s)
         return torch.tanh(mean)
 
@@ -157,12 +146,10 @@ class GaussianActor(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CQLAgent:
-    """
-    Conservative Q-Learning agent for continuous-action offline RL.
+    """CQL agent for continuous-action offline RL.
 
-    Observation interface: dict with keys 'observation' and 'desired_goal'
-    (PointMaze goal-conditioned format). Uses s = concat(obs, goal).
-    For flat-obs domains (Hopper, Walker2d), obs_desired_goal has dim 0.
+    Dict observations map to concat(observation, desired_goal). When the goal
+    keys are absent (flat-observation domains) the goal part has width 0.
     """
 
     def __init__(
@@ -184,6 +171,7 @@ class CQLAgent:
         self.loss_history: Dict[str, list] = {"q": [], "actor": []}
 
     def _build_networks(self, state_dim: int) -> None:
+        """Create Q, target Q, actor and optimizers for state_dim."""
         self.obs_dim = state_dim
         sd, ad = state_dim, self.act_dim
         hd, nh = self.cfg.hidden_dim, self.cfg.n_hidden
@@ -200,7 +188,7 @@ class CQLAgent:
     # ── observation processing ────────────────────────────────────────────────
 
     def _obs_to_state(self, obs: Any) -> np.ndarray:
-        """Dict or flat array → flat numpy state."""
+        """Flatten an observation; dicts become concat(observation, desired_goal)."""
         if isinstance(obs, dict):
             o = np.asarray(obs["observation"],   dtype=np.float32).reshape(-1)
             g = np.asarray(obs.get("desired_goal", np.zeros(0)),
@@ -211,6 +199,7 @@ class CQLAgent:
     def _dataset_to_tensors(
         self, dataset: Dict[str, Any]
     ) -> Tuple[torch.Tensor, ...]:
+        """Convert a transition dict to tensors (S, A, R, S2, D)."""
         def _t(x): return torch.as_tensor(
             np.asarray(x, dtype=np.float32), device=self.device)
 
@@ -234,7 +223,7 @@ class CQLAgent:
             _t(dataset["done"]),
         )
 
-    # ── CQL conservative Q loss ───────────────────────────────────────────────
+    # ── conservative term ─────────────────────────────────────────────────────
 
     def _cql_term(
         self,
@@ -242,35 +231,29 @@ class CQLAgent:
         s: torch.Tensor,   # [B, sd]
         a_data: torch.Tensor,  # [B, ad]
     ) -> torch.Tensor:
-        """
-        CQL-H conservative term (Kumar 2020 eq. 4):
-          logsumexp_{a~π ∪ a~unif}(Q(s,a)) - Q(s, a_data)
+        """CQL(H) term: mean of logsumexp_{a ~ pi or U}(Q(s, a)) - Q(s, a_data).
 
-        Uses importance-sampling correction for the policy distribution and
-        uniform distribution (no correction needed for uniform over [-1,1]^d).
+        Policy samples are importance-corrected by -log pi(a|s); the constant
+        uniform log-density is not subtracted from the uniform samples.
         """
         B  = s.shape[0]
         n  = self.cfg.n_action_samples
         ad = self.act_dim
 
-        # Policy samples
         with torch.no_grad():
             a_pi, log_pi = self.actor.sample_n(s, n)   # [B, n, ad], [B, n]
         s_rep = s.unsqueeze(1).expand(-1, n, -1).reshape(B * n, -1)
         q_pi  = q_net_fn(s_rep, a_pi.reshape(B * n, ad)).reshape(B, n)
-        # IS correction: subtract log π(a|s) so that logsumexp gives
-        # ∫ Q(s,a) da ≈ logsumexp(Q - log π) + const  (Kumar 2020 App. F)
+        # log E_pi[exp(Q) / pi] estimates log of the integral of exp(Q) over a.
         q_pi_is = q_pi - log_pi.detach()
 
-        # Uniform random samples (log prob = -act_dim * log 2 = const → omit)
+        # Uniform samples on [-1, 1]^ad; log-density term omitted.
         a_rand = torch.FloatTensor(B, n, ad).uniform_(-1.0, 1.0).to(self.device)
         q_rand = q_net_fn(s_rep, a_rand.reshape(B * n, ad)).reshape(B, n)
 
-        # logsumexp over both sets (concat along sample dim)
         all_q  = torch.cat([q_pi_is, q_rand], dim=1)            # [B, 2n]
         lse    = torch.logsumexp(all_q, dim=1) - np.log(2 * n)  # [B]
 
-        # In-distribution Q value
         q_data = q_net_fn(s, a_data)                             # [B]
 
         return (lse - q_data).mean()
@@ -278,11 +261,12 @@ class CQLAgent:
     # ── training ──────────────────────────────────────────────────────────────
 
     def _soft_update(self) -> None:
+        """Polyak update of the target Q network."""
         for p, pt in zip(self.q_net.parameters(), self.q_tgt.parameters()):
             pt.data.copy_(self.cfg.tau * p.data + (1.0 - self.cfg.tau) * pt.data)
 
     def train(self, dataset: Dict[str, Any], n_epochs: int = 200) -> None:
-        """Train CQL on the offline dataset."""
+        """Train on an offline transition dict; each epoch is one gradient step."""
         S, A, R, S2, D = self._dataset_to_tensors(dataset)
         N = S.shape[0]
         if N == 0:
@@ -309,7 +293,7 @@ class CQLAgent:
 
             α_s = self.cfg.alpha_sac
 
-            # ── SAC backup ───────────────────────────────────────────────────
+            # Soft Bellman target.
             with torch.no_grad():
                 a2, lp2 = self.actor.sample(s2)
                 q2_min  = self.q_tgt.min(s2, a2)
@@ -318,7 +302,7 @@ class CQLAgent:
             q1, q2 = self.q_net(s, a)
             q_std_loss = F.mse_loss(q1, q_tgt) + F.mse_loss(q2, q_tgt)
 
-            # ── CQL conservative term (applied to both Q heads) ─────────────
+            # Conservative term, applied to each Q head.
             cql1 = self._cql_term(
                 lambda ss, aa: self.q_net(ss, aa)[0], s, a)
             cql2 = self._cql_term(
@@ -330,7 +314,7 @@ class CQLAgent:
             q_loss.backward()
             self.q_opt.step()
 
-            # ── SAC actor update ─────────────────────────────────────────────
+            # SAC actor update.
             a_new, lp_new = self.actor.sample(s)
             q_new_min     = self.q_net.min(s, a_new)
             a_loss        = (α_s * lp_new - q_new_min).mean()
@@ -347,7 +331,7 @@ class CQLAgent:
 
     @torch.no_grad()
     def act(self, obs: Any) -> np.ndarray:
-        """Return deterministic mean action ∈ [-1,1]^act_dim."""
+        """Return the deterministic mean action in [-1, 1]^act_dim."""
         s = torch.as_tensor(self._obs_to_state(obs),
                             dtype=torch.float32, device=self.device).unsqueeze(0)
         if self.state_mean is not None:
@@ -356,4 +340,5 @@ class CQLAgent:
         return np.clip(a, -1.0, 1.0).astype(np.float32)
 
     def __call__(self, obs: Any) -> np.ndarray:
+        """Alias for act()."""
         return self.act(obs)

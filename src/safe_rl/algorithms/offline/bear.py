@@ -1,31 +1,23 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-"""
-bear.py — Bootstrapping Error Accumulation Reduction (Kumar et al., NeurIPS 2019)
-arXiv:1906.00949
+"""Bootstrapping Error Accumulation Reduction (Kumar et al., NeurIPS 2019,
+arXiv:1906.00949).
 
-BEAR constrains the learned policy to stay within the support of the behavior
-policy using a Maximum Mean Discrepancy (MMD) constraint enforced via a
-Lagrangian dual variable:
+SAC-style actor-critic whose actor is kept close to the behavior policy by an
+MMD constraint with a Lagrange multiplier:
+    actor:  max_pi E[Q(s, pi(s))]  s.t.  MMD(pi(.|s), pi_beta(.|s)) <= delta_mmd
+    dual:   lambda = exp(log_lam), updated by gradient ascent on lambda (MMD - delta_mmd)
+pi_beta is modeled by a conditional VAE.
 
-  Actor: max_π  E[Q(s,π(s))]  s.t.  MMD(π(·|s), π_β(·|s)) ≤ ε_mmd
-  Dual:  min_λ≥0  λ·(MMD - ε_mmd)  [λ updated by gradient ascent]
+    agent = BEARAgent(obs_dim, act_dim, cfg)
+    agent.train(dataset, n_epochs=200)
+    action = agent.act(obs)   # best of n_vae_samples VAE actions by min-Q
 
-The behavior policy π_β is modeled by a conditional VAE (encoder + decoder).
-
-Interface (identical to IQL/CQL):
-  agent = BEARAgent(obs_dim, act_dim, cfg)
-  agent.train(dataset, n_epochs=200)
-  action = agent.act(obs_dict)  # best of n_vae_samples by Q-value
-
-Hyperparameters follow the original paper:
-  Locomotion (Hopper, Walker2d) — Table 1:
-    delta_mmd=0.05, kernel='laplacian', kernel_bw=20,
-    n_mmd_samples=4, alpha_sac=0.05
-  AntMaze / PointMaze (navigation):
-    delta_mmd=0.1, same kernel, alpha_sac=0.1
+Defaults are the locomotion settings (delta_mmd=0.05, alpha_sac=0.05, Laplacian
+kernel, bandwidth 20, 4 MMD samples); maze domains use delta_mmd=0.1, alpha_sac=0.1.
 """
 from __future__ import annotations
 
@@ -49,44 +41,38 @@ LOG_STD_MAX = 2.0
 
 @dataclass
 class BEARConfig:
-    # Architecture
+    """BEAR hyperparameters."""
+
     hidden_dim: int = 256
     n_hidden:   int = 3
 
-    # VAE for behavior policy (paper: hidden=750, latent=2*act_dim)
+    # Behavior VAE
     vae_hidden_dim: int = 750
-    # latent_dim: set to 2*act_dim in __init__ if 0
-    vae_latent_dim: int = 0
+    vae_latent_dim: int = 0         # 0 -> 2 * act_dim
 
     # Training
     lr:         float = 3e-4
     lr_vae:     float = 3e-4
     batch_size: int   = 256
     gamma:      float = 0.99
-    tau:        float = 0.005       # soft target update
+    tau:        float = 0.005       # Polyak coefficient for the target Q network
 
-    # SAC temperature (fixed for offline RL)
-    # AntMaze/PointMaze: 0.1; Locomotion: 0.05
+    # Fixed SAC temperature.
     alpha_sac:  float = 0.05
 
-    # MMD constraint threshold
-    # Locomotion: 0.05 (Table 1); AntMaze/PointMaze: 0.1
+    # MMD constraint threshold.
     delta_mmd:  float = 0.05
 
-    # MMD kernel: 'laplacian' (default) or 'gaussian'
-    # Paper uses Laplacian with bandwidth σ=20
+    # MMD kernel: "laplacian" or anything else for Gaussian.
     kernel:     str   = "laplacian"
-    kernel_bw:  float = 20.0       # bandwidth σ for MMD kernel
+    kernel_bw:  float = 20.0
+    n_mmd_samples: int = 4         # samples per state from pi and from the VAE
 
-    # Number of samples for MMD estimation (paper: 4)
-    n_mmd_samples: int = 4
-
-    # Lagrange multiplier initialization and step size
-    log_lambda_init: float = 0.0   # start at λ=1
+    # Lagrange multiplier
+    log_lambda_init: float = 0.0   # lambda = 1
     lr_lambda:       float = 1e-3
 
-    # Number of VAE samples at inference (best-Q selection)
-    n_vae_samples:   int = 10
+    n_vae_samples:   int = 10      # candidate actions per state in act()
 
     normalize_states: bool = True
     device: str = "cpu"
@@ -108,6 +94,7 @@ def _mlp(in_dim: int, out_dim: int, hidden_dim: int, n_hidden: int) -> nn.Sequen
 
 
 class DoubleQNetwork(nn.Module):
+    """Two Q-heads for double-Q learning."""
     def __init__(self, state_dim: int, act_dim: int,
                  hidden_dim: int, n_hidden: int):
         super().__init__()
@@ -120,12 +107,13 @@ class DoubleQNetwork(nn.Module):
         return self.q1(sa).squeeze(-1), self.q2(sa).squeeze(-1)
 
     def min(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """Elementwise min of the two Q heads."""
         q1, q2 = self.forward(s, a)
         return torch.min(q1, q2)
 
 
 class GaussianActor(nn.Module):
-    """SAC-style stochastic actor with tanh squashing."""
+    """Tanh-squashed Gaussian actor (SAC)."""
     def __init__(self, state_dim: int, act_dim: int,
                  hidden_dim: int, n_hidden: int):
         super().__init__()
@@ -139,6 +127,7 @@ class GaussianActor(nn.Module):
 
     def sample(self, s: torch.Tensor
                ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reparameterized sample: (action, log_prob with tanh correction)."""
         mean, std = self._dist(s)
         eps = torch.randn_like(mean)
         x = mean + std * eps
@@ -149,7 +138,7 @@ class GaussianActor(nn.Module):
 
     def sample_n(self, s: torch.Tensor, n: int
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """[B,n,act_dim], [B,n]"""
+        """Sample n actions per state: actions [B, n, act_dim], log_probs [B, n]."""
         B = s.shape[0]
         s_rep = s.unsqueeze(1).expand(-1, n, -1).reshape(B * n, -1)
         a, lp = self.sample(s_rep)
@@ -157,24 +146,21 @@ class GaussianActor(nn.Module):
 
     @torch.no_grad()
     def mean_action(self, s: torch.Tensor) -> torch.Tensor:
+        """tanh(mean)."""
         mean, _ = self._dist(s)
         return torch.tanh(mean)
 
 
 class BehaviorVAE(nn.Module):
-    """
-    Conditional VAE for modeling the behavior policy π_β(a|s).
-    Architecture follows the BEAR paper: hidden=750, latent=2*act_dim.
+    """Conditional VAE model of the behavior policy pi_beta(a|s).
 
-    Encoder: (s, a) → (μ_z, σ_z)
-    Decoder: (s, z) → a  (tanh-squashed)
+    Encoder (s, a) -> (mu_z, std_z); decoder (s, z) -> tanh-squashed action.
     """
     def __init__(self, state_dim: int, act_dim: int,
                  hidden_dim: int, latent_dim: int):
         super().__init__()
         self.latent_dim = latent_dim
 
-        # Encoder
         self.enc = nn.Sequential(
             nn.Linear(state_dim + act_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),           nn.ReLU(),
@@ -182,7 +168,6 @@ class BehaviorVAE(nn.Module):
         self.mu_fc  = nn.Linear(hidden_dim, latent_dim)
         self.std_fc = nn.Linear(hidden_dim, latent_dim)
 
-        # Decoder
         self.dec = nn.Sequential(
             nn.Linear(state_dim + latent_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),              nn.ReLU(),
@@ -191,12 +176,14 @@ class BehaviorVAE(nn.Module):
 
     def encode(self, s: torch.Tensor, a: torch.Tensor
                ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the posterior mean and std of z."""
         h   = self.enc(torch.cat([s, a], dim=-1))
         mu  = self.mu_fc(h)
-        std = self.std_fc(h).clamp(-4.0, 15.0).exp()  # paper: clamp log_std
+        std = self.std_fc(h).clamp(-4.0, 15.0).exp()  # log_std clamped to [-4, 15]
         return mu, std
 
     def decode(self, s: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """Map (s, z) to an action in [-1, 1]."""
         return torch.tanh(self.dec(torch.cat([s, z], dim=-1)))
 
     def forward(self, s: torch.Tensor, a: torch.Tensor
@@ -209,13 +196,13 @@ class BehaviorVAE(nn.Module):
 
     @torch.no_grad()
     def sample(self, s: torch.Tensor) -> torch.Tensor:
-        """Sample actions from the modeled behavior policy."""
+        """Sample one action per state, with z ~ N(0, I) clipped to [-0.5, 0.5]."""
         z = torch.randn(s.shape[0], self.latent_dim, device=s.device).clamp(-0.5, 0.5)
         return self.decode(s, z)
 
     @torch.no_grad()
     def sample_n(self, s: torch.Tensor, n: int) -> torch.Tensor:
-        """Sample n actions per state. Returns [B, n, act_dim]."""
+        """Sample n actions per state (clipped prior as in sample()): [B, n, act_dim]."""
         B   = s.shape[0]
         s_r = s.unsqueeze(1).expand(-1, n, -1).reshape(B * n, -1)
         z   = torch.randn(B * n, self.latent_dim, device=s.device).clamp(-0.5, 0.5)
@@ -232,18 +219,15 @@ def _mmd(
     kernel: str = "laplacian",
     bw: float   = 20.0,
 ) -> torch.Tensor:
-    """
-    Biased MMD^2 estimator (Kumar 2019 Appendix A).
-    Returns scalar per batch element → shape [B].
-    """
+    """Biased (V-statistic) MMD^2 estimate per batch element, shape [B]."""
     n, m = x.shape[1], y.shape[1]
 
     def _k(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        # a,b: [B, ?, d]; compute kernel matrix [B, ?_a, ?_b]
-        diff = a.unsqueeze(2) - b.unsqueeze(1)           # [B, ?a, ?b, d]
-        dist = diff.pow(2).sum(-1)                        # [B, ?a, ?b]
+        # a: [B, na, d], b: [B, nb, d] -> kernel matrix [B, na, nb]
+        diff = a.unsqueeze(2) - b.unsqueeze(1)
+        dist = diff.pow(2).sum(-1)
         if kernel == "laplacian":
-            return torch.exp(-(dist + 1e-8).sqrt() / bw)   # +1e-8 for sqrt stability
+            return torch.exp(-(dist + 1e-8).sqrt() / bw)   # eps keeps sqrt differentiable at 0
         return torch.exp(-dist / (2.0 * bw ** 2))
 
     k_xx = _k(x, x).sum((1, 2)) / (n * n)               # [B]
@@ -257,12 +241,9 @@ def _mmd(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BEARAgent:
-    """
-    BEAR agent for continuous-action offline RL.
+    """BEAR agent for continuous-action offline RL.
 
-    Uses the same observation interface as IQL/CQL:
-      dict with 'observation' + 'desired_goal' (PointMaze),
-      or flat array (Hopper, Walker2d).
+    Accepts dict observations (concat(observation, desired_goal)) or flat arrays.
     """
 
     def __init__(
@@ -284,6 +265,7 @@ class BEARAgent:
         self.loss_history: Dict[str, list] = {"q": [], "vae": [], "actor": []}
 
     def _build_networks(self, state_dim: int) -> None:
+        """Create Q, target Q, actor, VAE, multiplier and optimizers for state_dim."""
         self.obs_dim = state_dim
         sd, ad = state_dim, self.act_dim
         hd, nh = self.cfg.hidden_dim, self.cfg.n_hidden
@@ -296,7 +278,7 @@ class BEARAgent:
 
         self.q_tgt.load_state_dict(self.q_net.state_dict())
 
-        # Lagrange multiplier log_λ (constrained to ≥ 0 via exp)
+        # lambda = exp(log_lam) >= 0.
         self.log_lam = torch.tensor(
             [self.cfg.log_lambda_init], requires_grad=True, device=self.device)
 
@@ -308,6 +290,7 @@ class BEARAgent:
     # ── observation processing ────────────────────────────────────────────────
 
     def _obs_to_state(self, obs: Any) -> np.ndarray:
+        """Flatten an observation; dicts become concat(observation, desired_goal)."""
         if isinstance(obs, dict):
             o = np.asarray(obs["observation"],  dtype=np.float32).reshape(-1)
             g = np.asarray(obs.get("desired_goal", np.zeros(0)),
@@ -318,6 +301,7 @@ class BEARAgent:
     def _dataset_to_tensors(
         self, dataset: Dict[str, Any]
     ) -> Tuple[torch.Tensor, ...]:
+        """Convert a transition dict to tensors (S, A, R, S2, D)."""
         def _t(x): return torch.as_tensor(
             np.asarray(x, dtype=np.float32), device=self.device)
         obs = np.concatenate([
@@ -337,11 +321,16 @@ class BEARAgent:
     # ── training ──────────────────────────────────────────────────────────────
 
     def _soft_update(self) -> None:
+        """Polyak update of the target Q network."""
         for p, pt in zip(self.q_net.parameters(), self.q_tgt.parameters()):
             pt.data.copy_(self.cfg.tau * p.data + (1.0 - self.cfg.tau) * pt.data)
 
     def train(self, dataset: Dict[str, Any], n_epochs: int = 200) -> None:
-        """Train BEAR on the offline dataset."""
+        """Train on an offline transition dict; each epoch is one gradient step.
+
+        Per step: VAE (ELBO with KL weight 0.5), soft Bellman critic update,
+        MMD-penalized actor update, dual update of lambda, target update.
+        """
         S, A, R, S2, D = self._dataset_to_tensors(dataset)
         N = S.shape[0]
         if N == 0:
@@ -367,7 +356,7 @@ class BEARAgent:
             idx = rng.choice(N, size=bs, replace=(N < bs))
             s, a, r, s2, d = S[idx], A[idx], R[idx], S2[idx], D[idx]
 
-            # ── VAE training (behavior policy) ───────────────────────────────
+            # Behavior VAE.
             a_recon, mu_z, std_z = self.vae(s, a)
             recon_loss = F.mse_loss(a_recon, a)
             kl_loss    = -0.5 * (1.0 + 2.0 * std_z.log()
@@ -377,7 +366,7 @@ class BEARAgent:
             vae_loss.backward()
             self.vae_opt.step()
 
-            # ── Q update (SAC backup, no conservatism needed — MMD handles it) ─
+            # Critic: soft Bellman target, no conservative term.
             with torch.no_grad():
                 a2, lp2 = self.actor.sample(s2)
                 q2_min  = self.q_tgt.min(s2, a2)
@@ -388,12 +377,9 @@ class BEARAgent:
             q_loss.backward()
             self.q_opt.step()
 
-            # ── Actor update with MMD constraint ─────────────────────────────
-            # Standard SAC-style actor update: maximize Q(s, a_new) - λ·MMD
-            # MMD constraint enforces π stays close to π_β (Kumar 2019, eq. 4).
+            # Actor: minimize -min Q(s, a_new) + lambda * MMD(pi, pi_beta); no entropy term.
             n_mmd = self.cfg.n_mmd_samples
 
-            # MMD between current policy and VAE behavior policy
             a_pi, _  = self.actor.sample_n(s, n_mmd)            # [B, n, ad]
             with torch.no_grad():
                 a_vae = self.vae.sample_n(s, n_mmd)             # [B, n, ad]
@@ -401,8 +387,7 @@ class BEARAgent:
             mmd = _mmd(a_pi, a_vae,
                        kernel=self.cfg.kernel, bw=self.cfg.kernel_bw).mean()
 
-            # Q-maximization: sample a single action per state from the actor
-            # (standard SAC actor loss, differentiable through reparameterization)
+            # One reparameterized action per state for the Q term.
             a_new, _ = self.actor.sample(s)                      # [B, ad]
             q_actor  = self.q_net.min(s, a_new)
             lam      = self.log_lam.exp().detach()
@@ -413,12 +398,12 @@ class BEARAgent:
             nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.a_opt.step()
 
-            # ── Dual variable update (λ ← max(0, λ + η·(MMD - ε))) ──────────
+            # Dual ascent: lambda grows while MMD exceeds delta_mmd.
             lam_loss = -(self.log_lam.exp() * (mmd.detach() - self.cfg.delta_mmd))
             self.lam_opt.zero_grad()
             lam_loss.backward()
             self.lam_opt.step()
-            # Clamp log_λ to avoid negative λ
+            # Keep lambda in [e^-10, e^10].
             with torch.no_grad():
                 self.log_lam.clamp_(min=-10.0, max=10.0)
 
@@ -432,11 +417,7 @@ class BEARAgent:
 
     @torch.no_grad()
     def act(self, obs: Any) -> np.ndarray:
-        """
-        BEAR deployment: sample n_vae_samples actions from the VAE,
-        return the one with the highest Q-value (best-of-N selection,
-        as described in the paper).
-        """
+        """Return the highest min-Q action among n_vae_samples VAE samples."""
         s = torch.as_tensor(self._obs_to_state(obs),
                             dtype=torch.float32, device=self.device).unsqueeze(0)
         if self.state_mean is not None:
@@ -445,9 +426,10 @@ class BEARAgent:
         a_s = self.vae.sample_n(s, n).squeeze(0)          # [n, act_dim]
         q_s = self.q_net.min(
             s.expand(n, -1), a_s
-        )                                                  # [n]
+        )
         best = q_s.argmax()
         return np.clip(a_s[best].cpu().numpy(), -1.0, 1.0).astype(np.float32)
 
     def __call__(self, obs: Any) -> np.ndarray:
+        """Alias for act()."""
         return self.act(obs)

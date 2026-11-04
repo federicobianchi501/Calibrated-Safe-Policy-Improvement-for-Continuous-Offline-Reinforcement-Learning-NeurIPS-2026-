@@ -1,8 +1,13 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-# scripts/offline/pointmaze/train_ppo_pointmaze_suboptimal.py
+"""Train the suboptimal PPO behavior policy for PointMaze_UMazeDense-v3.
+
+The environment defaults match the evaluation setup of the PointMaze benchmark; the
+short training budget and small network keep the policy deliberately suboptimal.
+"""
 import os
 import argparse
 
@@ -13,13 +18,12 @@ from safe_rl.envs.pointmaze_factory import make_pointmaze_env
 
 
 def main():
+    """Parse arguments, train PPO on PointMaze and save the model zip."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=str, default="models/ppo_pointmaze_baseline.zip")
 
-    # ENV CONFIG (MUST MATCH EVAL — defaults below match the paper Cal-SPI
-    # Point Maze setup so that a direct invocation of this script produces
-    # the same behavior policy used by run_benchmark_pointmaze.sh).
+    # Environment config; must match the one used at evaluation time.
     ap.add_argument("--continuing_task", type=int, default=0, choices=[0, 1])
     ap.add_argument("--reward_type", type=str, default="dense", choices=["sparse", "dense"])
     ap.add_argument("--reward_mode", type=str, default="speed_distance",
@@ -29,8 +33,7 @@ def main():
     ap.add_argument("--step_penalty", type=float, default=1.0)
     ap.add_argument("--dist_penalty", type=float, default=0.2)
 
-    # Suboptimality knobs (default 50,000 steps matches the paper Cal-SPI
-    # Point Maze setup, Tab. ppo-config in the appendix).
+    # PPO hyperparameters; budget and network size control suboptimality.
     ap.add_argument("--total_timesteps", type=int, default=50_000)
     ap.add_argument("--net", type=str, default="32,32")
     ap.add_argument("--gamma", type=float, default=0.99)

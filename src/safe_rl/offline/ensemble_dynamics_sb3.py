@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-"""
-ensemble_dynamics_sb3.py  [FIXED — MSE, MOReL-faithful]
+"""Deterministic K-member dynamics ensemble predicting s' - s.
 
-BUG FIX: Revert from NLL (probabilistic) to MSE (deterministic) ensemble.
+Members are trained with MSE, i.e. a fixed-covariance Gaussian likelihood, rather than
+a heteroscedastic NLL, so that disagreement between member means remains the
+uncertainty signal used by the gate.
 
-WHY:
-  The NLL ensemble pushes disagreement between members into sigma (aleatoric),
-  reducing mean disagreement (USAD). This breaks the USAD gate:
-    - NLL: u_usad median drops to ~0.09 at ds=50 -> gate fires on <5% of actions
-    - MSE: u_usad median ~0.3-0.4 at ds=50 -> gate fires correctly (30-70% coverage)
-
-  The USAD gate (gate_mode="uncertainty" or "calibrated" with uncertainty_type="usad")
-  is designed for DETERMINISTIC ensemble means (MOReL, NeurIPS 2020).
-  NLL is appropriate for reward-penalty style methods (MOPO, NeurIPS 2020), NOT hard gates.
-
-  MSE + USAD -> faithful to MOReL -> correct behavior.
-  NLL + USAD -> sigma absorbs disagreement -> gate is blind -> calibrated methods degenerate.
-
-Ensemble predicts delta for "observation" only.
-Goal dims derived separately in model_env_pointmaze.py.
+Provides next-state prediction (single member or ensemble mean) and the uncertainty
+scores u_USAD (max pairwise L2 distance between member means) and u_VAR (mean
+per-dimension variance). Only the "observation" entry is modelled; goal entries are
+handled by the model environments.
 """
 
 from __future__ import annotations
@@ -46,10 +37,7 @@ def _set_torch_seed(seed: int) -> None:
 
 
 def _pairwise_max_l2(v: np.ndarray) -> float:
-    """
-    v: [E, D]  — one mean-prediction per ensemble member.
-    Returns max_{i<j} ||v_i - v_j||_2   (MOReL USAD).
-    """
+    """Return max_{i<j} ||v_i - v_j||_2 for member predictions v of shape [E, D]."""
     E = v.shape[0]
     if E <= 1:
         return 0.0
@@ -63,11 +51,9 @@ def _pairwise_max_l2(v: np.ndarray) -> float:
 
 
 class DynMLP(nn.Module):
-    """
-    Configurable MLP for dynamics prediction.
-    Default hidden_dims=(512, 512) reproduces the MOReL-faithful 512x2 net.
-    Set hidden_dims=(200, 200, 200, 200) for MOPO-style 200x4.
-    Deterministic: outputs delta directly (no mu/sigma split).
+    """ReLU MLP mapping (s, a) to a deterministic delta prediction.
+
+    hidden_dims=(512, 512) gives the MOReL architecture; (200, 200, 200, 200) the MOPO one.
     """
     def __init__(self, in_dim: int, out_dim: int, hidden_dims: Tuple[int, ...] = (512, 512)):
         super().__init__()
@@ -84,33 +70,30 @@ class DynMLP(nn.Module):
         return self.net(x)
 
 
-# Backward-compatible alias used by legacy code paths.
+# Alias kept for older import sites.
 MLP512 = DynMLP
 
 
 @dataclass
 class EnsembleTrainConfig:
+    """Training configuration for EnsembleDynamicsSB3."""
     ensemble_size:    int   = 4
-    hidden_dims:      Tuple[int, ...] = (512, 512)  # net per ensemble member
+    hidden_dims:      Tuple[int, ...] = (512, 512)  # per member
     lr:               float = 1e-3
     batch_size:       int   = 256
     epochs:           int   = 50
-    bootstrap:        bool  = True   # per-member bootstrap resample → stronger diversity
-    normalize_inputs: bool  = True   # standardize (s,a) to zero-mean unit-var (MOReL/MOPO practice)
+    bootstrap:        bool  = True   # independent bootstrap resample per member
+    normalize_inputs: bool  = True   # standardize (s, a) with training-set mean/std
     seed:             int   = 0
     device:           str   = "cpu"
 
 
 class EnsembleDynamicsSB3:
-    """
-    Deterministic ensemble dynamics model (MSE loss, MOReL-faithful).
+    """Deterministic MSE-trained dynamics ensemble over flat observation vectors.
 
-    Members differ via independent random init + per-member bootstrap resample
-    (when bootstrap=True). Input (s,a) is standardized to zero-mean/unit-var
-    when normalize_inputs=True, matching MOReL/MOPO practice on locomotion tasks.
-
-    USAD gate works correctly because disagreement is expressed in the means,
-    not hidden inside an aleatoric sigma.
+    Members differ by random initialization and, when bootstrap=True, by an independent
+    bootstrap resample of the training set. Inputs (s, a) are standardized when
+    normalize_inputs=True. Member k is seeded with cfg.seed + 1000 * k.
     """
 
     def __init__(
@@ -125,7 +108,7 @@ class EnsembleDynamicsSB3:
         self.device  = torch.device(self.cfg.device)
         self.ensemble: List[nn.Module] = []
         self.optims:   List[optim.Optimizer] = []
-        # Normalization stats — set by fit_from_transitions when normalize_inputs=True
+        # Set by fit_from_transitions when normalize_inputs=True.
         self.input_mean: Optional[np.ndarray] = None
         self.input_std:  Optional[np.ndarray] = None
         self._build()
@@ -165,12 +148,13 @@ class EnsembleDynamicsSB3:
         *,
         verbose: bool = True,
     ) -> None:
-        """
-        Train ensemble on delta = next_obs - obs with MSE loss.
+        """Train every member on delta = next_obs - obs with MSE loss.
 
-        obs_dicts["observation"]:       [N, obs_dim]
-        actions:                        [N, act_dim]
-        next_obs_dicts["observation"]:  [N, obs_dim]
+        Args:
+            obs_dicts: dict with "observation" of shape [N, obs_dim].
+            actions: array of shape [N, act_dim].
+            next_obs_dicts: dict with "observation" of shape [N, obs_dim].
+            verbose: print normalization stats and periodic loss of member 0.
         """
         X = np.concatenate(
             [np.asarray(obs_dicts["observation"], np.float32),
@@ -180,7 +164,6 @@ class EnsembleDynamicsSB3:
         y = (np.asarray(next_obs_dicts["observation"], np.float32)
              - np.asarray(obs_dicts["observation"], np.float32))
 
-        # Input normalization: standardize (s,a) to zero-mean unit-var (MOReL/MOPO practice)
         if self.cfg.normalize_inputs:
             self.input_mean = X.mean(axis=0, keepdims=True).astype(np.float32)
             self.input_std  = np.maximum(X.std(axis=0, keepdims=True), 1e-8).astype(np.float32)
@@ -201,13 +184,12 @@ class EnsembleDynamicsSB3:
         for epoch in range(int(self.cfg.epochs)):
             for ki, (m, opt) in enumerate(zip(self.ensemble, self.optims)):
                 if self.cfg.bootstrap:
-                    # Per-member bootstrap: each member sees a different resample
                     boot_idx = rng_boot.integers(0, N, size=N)
                     Xk = X_t[boot_idx]
                     yk = y_t[boot_idx]
                     perm = torch.randperm(N, device=self.device)
                 else:
-                    # Same mini-batch order for all members (original MOReL behaviour)
+                    # Shared mini-batch order across members.
                     if ki == 0:
                         perm = torch.randperm(N, device=self.device)
                     Xk, yk = X_t, y_t
@@ -238,7 +220,7 @@ class EnsembleDynamicsSB3:
         obs_dict: Dict[str, np.ndarray],
         action:   np.ndarray,
     ) -> np.ndarray:
-        """Returns delta predictions: [E, obs_dim] — one per member."""
+        """Return per-member delta predictions of shape [E, obs_dim]."""
         x  = self._pack_input(obs_dict, action)
         xt = _to_torch(x, self.device)
         preds = []
@@ -253,7 +235,7 @@ class EnsembleDynamicsSB3:
         obs_dict: Dict[str, np.ndarray],
         action:   np.ndarray,
     ) -> np.ndarray:
-        """Deterministic: obs + mean_k[delta_k]. Best-estimate next state."""
+        """Return obs + mean_k delta_k (ensemble-mean next observation)."""
         mus  = self._predict_all(obs_dict, action)
         obs  = np.asarray(obs_dict["observation"], np.float32)
         return obs + mus.mean(axis=0)
@@ -267,12 +249,10 @@ class EnsembleDynamicsSB3:
         model_index: Optional[int]           = None,
         rng:         Optional[np.random.Generator] = None,
     ) -> np.ndarray:
-        """
-        Predict next observation using a single ensemble member.
+        """Predict the next observation with one ensemble member.
 
-        model_index = k  (0..K-1): use member k (PETS TS∞ / fixed_per_sim)
-        model_index = -1:           ensemble mean (fully deterministic)
-        model_index = None:         sample a random member
+        model_index = k in 0..K-1 uses member k (TS-infinity, fixed per simulation);
+        -1 uses the ensemble mean; None draws a member uniformly from rng.
         """
         mus = self._predict_all(obs_dict, action)   # [E, obs_dim]
         E   = mus.shape[0]
@@ -299,9 +279,7 @@ class EnsembleDynamicsSB3:
         model_index: Optional[int]                = None,
         rng:         Optional[np.random.Generator] = None,
     ) -> Dict[str, np.ndarray]:
-        """
-        Dict-level wrapper. achieved_goal is overwritten by model_env_pointmaze.py.
-        """
+        """Dict-level wrapper of sample_next_obs_vec; goal entries are copied unchanged."""
         obs_next = self.sample_next_obs_vec(
             obs_dict, action, model_index=model_index, rng=rng
         )
@@ -317,11 +295,7 @@ class EnsembleDynamicsSB3:
         obs_dict: Dict[str, np.ndarray],
         action:   np.ndarray,
     ) -> float:
-        """
-        MOReL USAD: max pairwise L2 distance among ensemble mean predictions.
-        With MSE training, this correctly captures epistemic uncertainty
-        (disagreement is in the means, not hidden in sigma).
-        """
+        """Return u_USAD: max pairwise L2 distance between member predictions."""
         mus = self._predict_all(obs_dict, action)
         return _pairwise_max_l2(mus)
 
@@ -331,7 +305,7 @@ class EnsembleDynamicsSB3:
         obs_dict: Dict[str, np.ndarray],
         action:   np.ndarray,
     ) -> float:
-        """Epistemic proxy: mean variance across dimensions of ensemble predictions."""
+        """Return u_VAR: per-dimension variance across members, averaged over dimensions."""
         mus = self._predict_all(obs_dict, action)
         return float(mus.var(axis=0).mean())
 
@@ -341,5 +315,5 @@ class EnsembleDynamicsSB3:
         obs_dict: Dict[str, np.ndarray],
         action:   np.ndarray,
     ) -> float:
-        """With MSE ensemble (no sigma), total = epistemic."""
+        """Same as uncertainty_epistemic; the ensemble has no aleatoric term."""
         return self.uncertainty_epistemic(obs_dict, action)

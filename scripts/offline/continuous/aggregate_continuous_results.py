@@ -1,29 +1,20 @@
 #!/usr/bin/env python3
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-"""
-aggregate_continuous_results.py — Aggregate Cal-SPI benchmark results for Walker2d / Hopper.
+"""Aggregate benchmark results for the MuJoCo domains (Hopper, HalfCheetah, Walker2d, Ant).
 
-Expected layout (produced by benchmark_continuous.py via run_benchmark_*.sh):
-    <root>/ds{DS}/seed{SEED}/results.csv
+Reads every results.csv under --root (layout <root>/ds{DS}/seed{SEED}/results.csv, written
+by benchmark_continuous.py) and computes, per (dataset_trajs, method), the mean, std and
+number of seeds of each metric, plus seed-paired deltas against the baseline method.
 
-The script:
-  1. Loads all results.csv under root
-  2. Aggregates mean ± STD over seeds for each (ds, method)
-  3. Saves:
-     - aggregated_results.csv       (absolute metrics, mean+std over seeds)
-     - aggregated_delta_vs_ppo.csv  (delta vs ppo_only baseline, seed-paired)
-     - plot_return_mean.svg
-     - plot_cvar15.svg
-     - plot_success_rate.svg
-     - plot_xvel_mean.svg
+Outputs in --outdir: aggregated_results.csv and aggregated_results_absolute.csv (identical),
+aggregated_delta_vs_<baseline>.csv, the 4-panel main figure (full and zoomed), and SVG
+plots of absolute, delta and percentage-delta metrics.
 
-Usage:
-    python aggregate_continuous_results.py --root results_continuous_walker2d
-    python aggregate_continuous_results.py --root results_continuous_hopper \\
-        --outdir results_continuous_hopper/aggregated
+    python aggregate_continuous_results.py --root <results_root> [--outdir <dir>]
 """
 from __future__ import annotations
 
@@ -48,7 +39,7 @@ BASELINE_METHOD = "ppo_only"
 BAND_MODE_CHOICES = ["none", "std", "sem", "ci95"]
 DEFAULT_XLABEL = r"Number of trajectories in dataset $\mathcal{D}$"
 
-# Methods always plotted last (Cal-SPI variants, most prominent in legend)
+# Methods drawn last, so they appear on top and at the end of the legend.
 USER_METHODS_LAST = [
     "morel_usad",
     "calibrated_variance",
@@ -57,6 +48,7 @@ USER_METHODS_LAST = [
 
 
 def _legend_ncol(n_items: int, max_cols: int = 4) -> int:
+    """Number of legend columns, between 1 and `max_cols`."""
     return min(max_cols, max(1, n_items))
 
 
@@ -76,7 +68,7 @@ METRICS = [
 ]
 
 # ── Plot config ───────────────────────────────────────────────────────────────
-# Colors/markers are kept in sync with aggregate_pointmaze_results.py
+# Same colors and markers as aggregate_pointmaze_results.py.
 METHOD_STYLE: Dict[str, Dict] = {
     "ppo_only": {
         "label": "Baseline",
@@ -183,7 +175,7 @@ METHOD_ORDER = [
 # ── CSV loading ───────────────────────────────────────────────────────────────
 
 def _infer_ds_seed(path: str) -> Tuple[Optional[int], Optional[int]]:
-    """Infer ds and seed from path like '.../ds50/seed3/results.csv'."""
+    """Parse dataset size and seed from a path such as '.../ds50/seed3/results.csv'."""
     parts = path.replace("\\", "/").split("/")
     ds, seed = None, None
     for p in parts:
@@ -195,10 +187,11 @@ def _infer_ds_seed(path: str) -> Tuple[Optional[int], Optional[int]]:
 
 
 def _load_one(path: str) -> pd.DataFrame:
+    """Load one results.csv and add dataset_trajs, seed and cvar_15 columns if missing."""
     df = pd.read_csv(path)
     ds, seed = _infer_ds_seed(path)
 
-    # Normalise column names
+    # Fill dataset_trajs and seed from aliases or from the path.
     if "dataset_trajs" not in df.columns:
         for alt in ("ds", "dataset", "n_trajs"):
             if alt in df.columns:
@@ -216,7 +209,6 @@ def _load_one(path: str) -> pd.DataFrame:
         else:
             raise ValueError(f"Cannot infer seed from {path}")
 
-    # cvar_15 alias
     if "cvar_15" not in df.columns and "cvar15" in df.columns:
         df["cvar_15"] = df["cvar15"]
 
@@ -227,6 +219,7 @@ def _load_one(path: str) -> pd.DataFrame:
 
 
 def load_all(root: str) -> pd.DataFrame:
+    """Concatenate all results.csv files found recursively under `root`."""
     pattern = os.path.join(root, "**", "results.csv")
     paths = sorted(glob.glob(pattern, recursive=True))
     if not paths:
@@ -246,15 +239,14 @@ def load_all(root: str) -> pd.DataFrame:
 # ── Aggregation ───────────────────────────────────────────────────────────────
 
 def aggregate_absolute(df_all: pd.DataFrame) -> pd.DataFrame:
-    """
-    Mean ± STD over seeds for each (dataset_trajs, method).
-    If multiple rows per (ds, seed, method) exist, average them first.
+    """Mean, std (ddof=1) and n_seeds of each metric per (dataset_trajs, method).
+
+    Multiple rows for the same (ds, seed, method) are averaged first.
     """
     present = [m for m in METRICS if m in df_all.columns]
     df = df_all[["dataset_trajs", "seed", "method"] + present].copy()
     df = df.dropna(subset=["dataset_trajs", "seed", "method"])
 
-    # Per-seed average (handles duplicates)
     df_s = df.groupby(["dataset_trajs", "method", "seed"], as_index=False)[present].mean()
 
     mean = df_s.groupby(["dataset_trajs", "method"], as_index=False)[present].mean()
@@ -273,8 +265,9 @@ def aggregate_delta(
     df_all: pd.DataFrame,
     baseline: str = "ppo_only",
 ) -> pd.DataFrame:
-    """
-    Seed-paired delta vs baseline: Δmetric = metric(method) - metric(baseline).
+    """Seed-paired deltas delta_m = m(method) - m(baseline), aggregated over seeds.
+
+    Returns an empty DataFrame if the baseline is absent.
     """
     present = [m for m in METRICS if m in df_all.columns]
     df = df_all[["dataset_trajs", "seed", "method"] + present].copy()
@@ -312,6 +305,7 @@ def aggregate_delta(
 # ── Console table ─────────────────────────────────────────────────────────────
 
 def print_table(agg: pd.DataFrame, metrics: List[str], title: str = "") -> None:
+    """Print the selected metric columns (and their std) rounded to 4 decimals."""
     if title:
         print(f"\n{'─'*60}")
         print(f"  {title}")
@@ -331,9 +325,10 @@ def print_table(agg: pd.DataFrame, metrics: List[str], title: str = "") -> None:
     print(df_show.to_string(index=False))
 
 
-# ── Plotting helpers (mirrors aggregate_pointmaze_results.py style) ───────────
+# ── Plotting helpers ──────────────────────────────────────────────────────────
 
 def _ordered_methods(agg: pd.DataFrame, include_baseline: bool = True) -> List[str]:
+    """Plot order: baseline, styled methods, unstyled methods, then USER_METHODS_LAST."""
     present = set(agg["method"].unique().tolist())
     baseline = [BASELINE_METHOD] if include_baseline and BASELINE_METHOD in present else []
     styled_middle = [
@@ -351,6 +346,7 @@ def _ordered_methods(agg: pd.DataFrame, include_baseline: bool = True) -> List[s
 def _compute_yerr(
     sub: pd.DataFrame, metric: str, band_mode: str = "none"
 ) -> Optional[np.ndarray]:
+    """Band half-width: std, sem or ci95 (1.96 * sem); None for band_mode "none"."""
     if band_mode == "none":
         return None
     std_col = f"{metric}__std"
@@ -371,6 +367,7 @@ def _compute_yerr(
 
 
 def _add_y_headroom(ax, top_frac: float = 0.10, bottom_frac: float = 0.03) -> None:
+    """Expand the y-limits by the given fractions of the current range."""
     ymin, ymax = ax.get_ylim()
     yr = ymax - ymin
     if not np.isfinite(ymin) or not np.isfinite(ymax) or yr <= 0:
@@ -380,17 +377,19 @@ def _add_y_headroom(ax, top_frac: float = 0.10, bottom_frac: float = 0.03) -> No
 
 def _auto_zoom_ymin(agg: pd.DataFrame, metric: str, baseline: str = BASELINE_METHOD,
                     competitive_frac: float = 0.70) -> Optional[float]:
-    """
-    Compute ymin as the minimum mean of "competitive" methods (those that
-    achieve >= competitive_frac * baseline mean across any ds value), minus
-    a small margin. This excludes collapsed methods from setting the floor.
+    """Lower y-limit for zoomed plots.
+
+    A method is competitive if its mean over dataset sizes is at least
+    `competitive_frac` times the baseline mean. Returns the smallest competitive mean
+    minus max(5, 3% of the baseline mean), clipped at 0, so methods with much lower
+    returns do not set the floor. Returns None if the baseline is missing.
     """
     base_rows = agg[agg["method"] == baseline][metric].dropna()
     if base_rows.empty:
         return None
     base_mean = float(base_rows.mean())
     threshold = competitive_frac * base_mean
-    # Per-method global mean
+    # Mean over dataset sizes, per method.
     method_means = agg.groupby("method")[metric].mean()
     competitive = method_means[method_means >= threshold]
     if competitive.empty:
@@ -415,6 +414,7 @@ def _plot_metric(
     ymin: Optional[float] = None,
     ymax: Optional[float] = None,
 ) -> None:
+    """Plot one metric against dataset size for all methods and save it as SVG."""
     if not _MATPLOTLIB:
         print(f"[WARN] matplotlib not available — skipping {filename_stub}")
         return
@@ -521,6 +521,7 @@ def _plot_panel(
     ymin: Optional[float] = None,
     ymax: Optional[float] = None,
 ) -> None:
+    """Draw one metric against dataset size on `ax`; shows a placeholder if it is missing."""
     if metric is None or metric not in agg.columns:
         ax.axis("off")
         ax.text(0.5, 0.5, f"Missing metric:\n{metric}", ha="center", va="center",
@@ -591,12 +592,11 @@ def plot_main_figure_4panel(
     delta_band_mode: str = "ci95",
     ymin_return: Optional[float] = None,
 ) -> None:
-    """
-    4-panel figure (mirrors pointmaze style):
-      A) Mean return (absolute)
-      B) Mean x-velocity (absolute, domain-specific)
-      C) Δ mean return vs baseline (delta, seed-paired)
-      D) Δ CVaR₁₅ vs baseline (delta, seed-paired)
+    """Save the 2x2 main figure.
+
+    Panels: A) mean return, B) mean x-velocity (absolute); C) mean return delta and
+    D) CVaR_0.15 delta against the baseline (seed-paired). `ymin_return` sets the lower
+    y-limit of panel A.
     """
     os.makedirs(outdir, exist_ok=True)
 
@@ -663,9 +663,10 @@ def plot_main_figure_4panel(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    """Command-line entry point."""
     ap = argparse.ArgumentParser(description="Aggregate Cal-SPI continuous benchmark results")
     ap.add_argument("--root", type=str, required=True,
-                    help="Root results directory (e.g. results_continuous_walker2d)")
+                    help="Root directory containing ds*/seed*/results.csv")
     ap.add_argument("--outdir", type=str, default=None,
                     help="Output directory (default: <root>/aggregated)")
     ap.add_argument("--baseline_method", type=str, default="ppo_only",
@@ -681,8 +682,8 @@ def main() -> None:
     ap.add_argument("--no_plots", action="store_true",
                     help="Skip all plot generation")
     ap.add_argument("--return_ymin", type=float, default=None,
-                    help="Fix y-axis lower bound for absolute return plots "
-                         "(e.g. 400). Default: auto-zoom at 50%% of baseline mean.")
+                    help="Lower y-limit for the zoomed return plots. "
+                         "Default: computed from the competitive methods.")
     args = ap.parse_args()
 
     outdir = args.outdir or os.path.join(args.root, "aggregated")
@@ -698,7 +699,7 @@ def main() -> None:
     agg_abs = aggregate_absolute(df_all)
     agg_delta = aggregate_delta(df_all, baseline=args.baseline_method)
 
-    # Add percentage-delta columns: delta_<metric>_pct = delta / baseline_mean * 100
+    # Percentage deltas: delta_<m>_pct = delta_<m> / |baseline mean of m| * 100, per ds.
     if not agg_delta.empty:
         base_means = (agg_abs[agg_abs["method"] == args.baseline_method]
                       .groupby("dataset_trajs")[list(
@@ -736,7 +737,7 @@ def main() -> None:
         print(f"\n[AGG] Done (no plots). All CSVs in: {outdir}")
         return
 
-    # ── Compute zoom ymin (auto or explicit) ─────────────────────────────────
+    # ── Lower y-limit for zoomed plots ────────────────────────────────────────
     zoom_ymin = args.return_ymin
     if zoom_ymin is None:
         zoom_ymin = _auto_zoom_ymin(agg_abs, "return_mean",
@@ -755,7 +756,7 @@ def main() -> None:
             abs_band_mode=args.abs_band_mode,
             delta_band_mode=args.delta_band_mode,
         )
-        # Zoom version: y-axis clipped to show top-method differences
+        # Zoomed version: y-axis starts at zoom_ymin.
         plot_main_figure_4panel(
             agg_abs=agg_abs,
             agg_delta=agg_delta,
@@ -775,7 +776,7 @@ def main() -> None:
                      band_mode=args.abs_band_mode,
                      title="Mean return",
                      include_baseline=True)
-        # Zoom version
+        # Zoomed version
         _plot_metric(agg_abs, "return_mean", outdir,
                      ylabel=r"$\bar{\rho}(\pi, M^*)$",
                      filename_stub="plot_return_mean_zoom",

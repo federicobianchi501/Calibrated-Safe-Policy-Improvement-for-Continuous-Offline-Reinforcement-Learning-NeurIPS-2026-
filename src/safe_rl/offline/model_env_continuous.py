@@ -1,19 +1,15 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-"""
-model_env_continuous.py — Learned dynamics model for flat-obs MuJoCo envs.
+"""Learned-model environment for flat-observation MuJoCo locomotion domains.
 
-Analogous to ModelPointMazeEnv but for Walker2d, Hopper (no dict obs, no goal).
-
-Key design:
-  - Observations are flat numpy arrays.
-  - The ensemble (EnsembleDynamicsSB3) expects dict obs with "observation" key.
-    This module wraps flat obs as {"observation": obs} internally via EnsembleFlatWrapper.
-  - Reward is reconstructed from predicted obs using known locomotion reward formulas.
-  - Termination uses standard health conditions (z_height, angle bounds).
-  - MCTS planner sees flat obs throughout; the wrapper handles dict conversion.
+Same step interface as ModelPointMazeEnv, without goals. Flat observations are wrapped
+as {"observation": obs} for the ensemble by EnsembleFlatWrapper. The reward is computed
+from the predicted observation with the Gymnasium locomotion formula
+(x velocity + healthy reward - control cost), and termination from the healthy
+z-height and angle ranges of the domain.
 """
 from __future__ import annotations
 
@@ -26,13 +22,10 @@ from safe_rl.offline.ensemble_dynamics_sb3 import EnsembleDynamicsSB3
 
 
 class EnsembleFlatWrapper:
-    """
-    Adapter: wraps EnsembleDynamicsSB3 so it accepts flat numpy obs
-    (in addition to dict obs) without modifying the original class.
+    """Adapter that lets EnsembleDynamicsSB3 accept flat observation arrays.
 
-    The MCTS planner accesses model_env.ens and calls uncertainty_usad(obs, action)
-    directly with whatever obs the planner holds. For continuous envs the planner
-    holds flat obs. This wrapper transparently converts flat -> dict.
+    Flat inputs are converted to {"observation": obs}; dict inputs pass through.
+    Attributes not defined here are forwarded to the wrapped ensemble.
     """
 
     def __init__(self, ensemble: EnsembleDynamicsSB3):
@@ -43,27 +36,32 @@ class EnsembleFlatWrapper:
             return obs
         return {"observation": np.asarray(obs, dtype=np.float32)}
 
-    # ---- Methods the MCTS planner calls via model_env.ens ----
+    # ---- Methods called by the planner through model_env.ens ----
 
     def uncertainty_usad(self, obs, action: np.ndarray) -> float:
+        """Return u_USAD for a flat or dict observation."""
         return float(self._ens.uncertainty_usad(self._to_dict(obs), action))
 
     def uncertainty_epistemic(self, obs, action: np.ndarray) -> float:
+        """Return u_VAR for a flat or dict observation."""
         return float(self._ens.uncertainty_epistemic(self._to_dict(obs), action))
 
     def uncertainty_total(self, obs, action: np.ndarray) -> float:
+        """Return the ensemble's total uncertainty (equal to u_VAR)."""
         return float(self._ens.uncertainty_total(self._to_dict(obs), action))
 
     def _predict_all(self, obs, action: np.ndarray) -> np.ndarray:
         return self._ens._predict_all(self._to_dict(obs), action)
 
     def sample_next_obs_vec(self, obs, action: np.ndarray, **kwargs) -> np.ndarray:
+        """Predict the next observation; kwargs as in EnsembleDynamicsSB3."""
         return self._ens.sample_next_obs_vec(self._to_dict(obs), action, **kwargs)
 
     def predict_next_obs_vec_mean(self, obs, action: np.ndarray) -> np.ndarray:
+        """Return the ensemble-mean next observation."""
         return self._ens.predict_next_obs_vec_mean(self._to_dict(obs), action)
 
-    # ---- Pass-through everything else (e.g. .ensemble list for MOPO) ----
+    # ---- Remaining attributes (e.g. .ensemble) are forwarded ----
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._ens, name)
@@ -72,7 +70,7 @@ class EnsembleFlatWrapper:
 @dataclass
 class ModelContinuousEnvConfig:
     """Configuration for ModelContinuousEnv."""
-    # Domain identity (from continuous_env_factory.DOMAIN_CONFIGS)
+    # Key of continuous_env_factory.DOMAIN_CONFIGS
     domain: str = "walker2d"
 
     # Episode control
@@ -81,12 +79,12 @@ class ModelContinuousEnvConfig:
     obs_clip: float = 1e3
     terminate_on_nan: bool = True
 
-    # Reward reconstruction (must match gymnasium defaults)
-    vel_obs_idx: int = 8          # index of x_velocity in obs
+    # Reward terms; defaults match Gymnasium
+    vel_obs_idx: int = 8          # obs index of the x velocity
     ctrl_cost_weight: float = 1e-3
     healthy_reward: float = 1.0
 
-    # Termination / health conditions
+    # Healthy ranges; leaving them terminates the episode
     z_obs_idx: int = 0
     angle_obs_idx: int = 1
     healthy_z_lo: float = 0.8
@@ -95,7 +93,7 @@ class ModelContinuousEnvConfig:
 
     @classmethod
     def for_domain(cls, domain: str) -> "ModelContinuousEnvConfig":
-        """Create config from DOMAIN_CONFIGS entry."""
+        """Build the config from the DOMAIN_CONFIGS entry of a domain."""
         from safe_rl.envs.continuous_env_factory import DOMAIN_CONFIGS
         d = DOMAIN_CONFIGS[domain]
         z_lo, z_hi = d["healthy_z_range"]
@@ -114,16 +112,11 @@ class ModelContinuousEnvConfig:
 
 
 class ModelContinuousEnv:
-    """
-    Learned model environment for flat-obs continuous MuJoCo domains.
+    """Learned-model environment for flat-observation MuJoCo domains.
 
-    Analogous to ModelPointMazeEnv. Key differences:
-      - obs is a flat numpy array (not a dict)
-      - reward reconstructed from predicted obs via known locomotion formula
-      - termination from health conditions (z_height, angle)
-      - self.ens is an EnsembleFlatWrapper for MCTS planner compatibility
-
-    NOTE: truncate_on_time_limit=False for MCTS (planning horizon = max_depth).
+    obs is a flat array; the reward is computed from the predicted observation and the
+    action, and termination from the healthy ranges. self.ens is an EnsembleFlatWrapper.
+    For MCTS use truncate_on_time_limit=False; the tree depth is then the horizon.
     """
 
     def __init__(
@@ -136,6 +129,7 @@ class ModelContinuousEnv:
         self._t = 0
 
     def reset_counter(self) -> None:
+        """Reset the step counter used for time-limit truncation."""
         self._t = 0
 
     def _is_healthy(self, obs: np.ndarray) -> bool:
@@ -146,7 +140,7 @@ class ModelContinuousEnv:
         return bool(z_ok and a_ok)
 
     def _reward(self, obs_next: np.ndarray, action: np.ndarray) -> float:
-        """Reconstruct locomotion reward from predicted next-obs and action."""
+        """Return x_velocity + healthy_reward * healthy - ctrl_cost_weight * ||a||^2."""
         x_vel    = float(obs_next[self.cfg.vel_obs_idx])
         ctrl     = float(self.cfg.ctrl_cost_weight * np.sum(np.asarray(action) ** 2))
         healthy  = float(self.cfg.healthy_reward) if self._is_healthy(obs_next) else 0.0
@@ -167,17 +161,17 @@ class ModelContinuousEnv:
         model_index: Optional[int] = None,
         rng: Optional[np.random.Generator] = None,
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        """
-        Step the learned model.
+        """Advance one model step.
 
         Args:
-            obs:         flat observation [obs_dim]
-            action:      action [act_dim] — clipped to [-1, 1] internally
-            model_index: which ensemble member to use (None = random)
-            rng:         random generator for member sampling
+            obs: flat observation of shape [obs_dim].
+            action: action of shape [act_dim], clipped to [-1, 1].
+            model_index: ensemble member (None draws one from rng, -1 uses the mean).
+            rng: generator for member sampling.
 
         Returns:
-            (obs_next, reward, terminated, truncated, info)
+            (obs_next, reward, terminated, truncated, info). Non-finite predictions end
+            the episode with reward 0 when cfg.terminate_on_nan is set.
         """
         if rng is None:
             rng = np.random.default_rng()
@@ -187,7 +181,6 @@ class ModelContinuousEnv:
 
         a = np.clip(np.asarray(action, dtype=np.float32).ravel(), -1.0, 1.0)
 
-        # Predict next obs via ensemble (wrapper handles flat->dict conversion)
         obs_next = self.ens.sample_next_obs_vec(obs, a, model_index=model_index, rng=rng)
         obs_next, ok = self._finite_and_clip(obs_next)
 
@@ -202,7 +195,7 @@ class ModelContinuousEnv:
             truncated = True
 
         info: Dict[str, Any] = {
-            "success": 0.0,  # locomotion has no binary success; survival is tracked by caller
+            "success": 0.0,  # no binary success in locomotion
             "x_velocity": float(obs_next[self.cfg.vel_obs_idx]),
             "is_healthy": float(self._is_healthy(obs_next)),
         }

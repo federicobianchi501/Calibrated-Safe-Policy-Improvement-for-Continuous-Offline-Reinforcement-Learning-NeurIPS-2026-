@@ -1,13 +1,14 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
 """
-train_ppo_continuous.py — Train a suboptimal PPO behavior policy for Walker2d or Hopper.
+Train a suboptimal PPO behavior policy on a MuJoCo domain (Hopper, HalfCheetah,
+Walker2d, Ant).
 
-Intentionally suboptimal (small network, few timesteps) to match the Cal-SPI
-experimental setup: a reasonable but imperfect behavior policy from which we
-want to improve.
+A small network and a short training budget give a reasonable but imperfect
+baseline policy, used to collect the offline dataset and as the fallback policy.
 
 Usage:
     python train_ppo_continuous.py --domain walker2d --seed 0 --out models/ppo_walker2d_100k.zip
@@ -17,32 +18,29 @@ import argparse
 import os
 import sys
 
-# Ensure src is on path when run directly
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "src"))
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.utils import set_random_seed
 
-from safe_rl.envs.continuous_env_factory import make_continuous_env
+from safe_rl.envs.continuous_env_factory import DOMAIN_CONFIGS, make_continuous_env
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Train suboptimal PPO for Walker2d/Hopper")
+    """Parse arguments, train PPO and save the checkpoint."""
+    ap = argparse.ArgumentParser(description="Train a suboptimal PPO behavior policy")
     ap.add_argument("--domain", type=str, required=True,
-                    choices=["walker2d", "hopper", "halfcheetah", "reacher", "swimmer"],
+                    choices=sorted(DOMAIN_CONFIGS),
                     help="Domain to train on")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=str, required=True,
                     help="Path to save PPO checkpoint (.zip)")
 
-    # Suboptimality knobs — smaller/fewer = more suboptimal.
-    # Default 70k matches the paper Hopper PPO baseline; HalfCheetah uses 200k
-    # (set via --total_timesteps when invoking from run_benchmark_halfcheetah.sh).
+    # Smaller networks and fewer timesteps give a more suboptimal policy.
     ap.add_argument("--total_timesteps", type=int, default=70_000,
-                    help="Total environment steps for training "
-                         "(default 70k matches paper Hopper).")
+                    help="Total environment steps for training")
     ap.add_argument("--net", type=str, default="64,64",
-                    help="Hidden layer sizes (smaller = more suboptimal)")
+                    help="Comma-separated hidden layer sizes")
     ap.add_argument("--gamma", type=float, default=0.99)
     ap.add_argument("--n_steps", type=int, default=2048)
     ap.add_argument("--batch_size", type=int, default=64)

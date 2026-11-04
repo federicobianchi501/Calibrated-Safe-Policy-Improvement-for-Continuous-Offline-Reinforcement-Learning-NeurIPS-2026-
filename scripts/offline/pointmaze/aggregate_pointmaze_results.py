@@ -1,35 +1,18 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-"""
-Aggregate PointMaze benchmark results across seeds and produce paper-ready plots.
+"""Aggregate PointMaze benchmark results across seeds and plot them.
 
-Assumes per-run outputs like:
-<root>/ds{DS}/seed{SEED}/results.csv
+Reads every <root>/ds{DS}/seed{SEED}/results.csv and computes, per (dataset_trajs, method):
+  - absolute metrics: mean, std and number of seeds;
+  - paired deltas against a baseline method, computed seed by seed.
 
-This patched version:
-1) loads all results.csv under root
-2) normalizes key columns
-3) builds TWO aggregations:
-   - absolute metrics over seeds for each (dataset_trajs, method)
-   - paired delta-vs-baseline metrics over seeds for each (dataset_trajs, method)
-4) saves:
-   - aggregated_results.csv                      # absolute aggregation (backward-compatible name)
-   - aggregated_results_absolute.csv            # same as above
-   - aggregated_results_delta_vs_ppo.csv        # paired deltas vs baseline
-   - plot_return_mean.svg                       # absolute
-   - plot_cvar15.svg                            # absolute
-   - plot_success_rate.svg                      # absolute
-   - plot_delta_return_mean_vs_ppo.svg
-   - plot_delta_cvar15_vs_ppo.svg
-   - plot_delta_success_rate_vs_ppo.svg
-   - optional trajectory plots
-   - optional main 4-panel figure
-
-Trajectory plotting mode:
-- produces ONE FIGURE PER SAVED EPISODE INDEX
-- each figure overlays all methods for the same episode index
+Writes to --outdir: aggregated_results.csv and aggregated_results_absolute.csv (identical),
+aggregated_results_delta_vs_<baseline>.csv, absolute and delta plots for return_mean,
+cvar15 and success_rate, and optionally the 4-panel main figure and trajectory plots
+(one figure per saved episode index, overlaying all methods).
 """
 from __future__ import annotations
 
@@ -60,16 +43,18 @@ BASELINE_METHOD = "ppo_only"
 
 
 def _legend_ncol(n_items: int, max_cols: int = 4) -> int:
+    """Number of legend columns, capped at `max_cols`."""
     if n_items <= 0:
         return 1
     return min(max_cols, n_items)
 
 
 def _legend_top_rect(n_items: int, ncol: int) -> float:
+    """Top of the tight_layout rect that leaves room for a legend above the axes."""
     nrows = max(1, math.ceil(n_items / ncol))
     return max(0.72, 0.90 - 0.08 * (nrows - 1))
 
-# Keys MUST match the `method` strings appearing in results.csv.
+# Keys are the `method` strings written to results.csv.
 METHOD_STYLE: Dict[str, Dict[str, object]] = {
     "ppo_only": {
         "label": "Baseline",
@@ -159,12 +144,11 @@ TRAJ_METHOD_ORDER = [
 # ============================================================================
 
 def _find_traj_npz(root: str, ds: int, seed: int) -> Dict[str, List[str]]:
-    """
-    Expected layout from benchmark:
-      PPO:
-        <root>/<traj_out_subdir>/seed{SEED}/ppo_only_ep{EI}.npz
-      other methods:
-        <root>/<traj_out_subdir>/ds{DS}/seed{SEED}/{method}_ep{EI}.npz
+    """Find saved trajectory files for (ds, seed), keyed by method.
+
+    Layout written by the benchmark:
+      PPO:            <root>/<traj_out_subdir>/seed{SEED}/ppo_only_ep{EI}.npz
+      other methods:  <root>/<traj_out_subdir>/ds{DS}/seed{SEED}/{method}_ep{EI}.npz
     """
     out: Dict[str, List[str]] = {}
 
@@ -185,6 +169,7 @@ def _find_traj_npz(root: str, ds: int, seed: int) -> Dict[str, List[str]]:
 
 
 def _load_traj_npz(path: str) -> Dict[str, Any]:
+    """Load one trajectory npz (xy, start, goal and optional per-episode fields)."""
     z = np.load(path, allow_pickle=False)
     out = {
         "xy": np.asarray(z["xy"], dtype=np.float32),
@@ -219,6 +204,7 @@ def _load_trajs_for_ds_seed(
     seed: int,
     max_episodes_per_method: Optional[int] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
+    """Load up to `max_episodes_per_method` trajectories per method for (ds, seed)."""
     found = _find_traj_npz(root, ds=ds, seed=seed)
     out: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -239,6 +225,10 @@ def plot_trajectories_for_ds_seed(
     max_episodes_per_method: int = 1,
     filename: Optional[str] = None,
 ) -> Optional[str]:
+    """Plot all methods' trajectories for (ds, seed) in a single figure.
+
+    Returns the path of the saved SVG, or None if no trajectory file is found.
+    """
     trajs_by_method = _load_trajs_for_ds_seed(
         root=root,
         ds=int(ds),
@@ -344,6 +334,7 @@ def plot_trajectories_for_ds_seed(
 
 
 def _extract_episode_idx_from_path(path: str) -> Optional[int]:
+    """Parse the episode index from a `*_ep{EI}.npz` filename."""
     m = re.search(r"_ep(\d+)\.npz$", os.path.basename(path))
     if m is None:
         return None
@@ -351,6 +342,7 @@ def _extract_episode_idx_from_path(path: str) -> Optional[int]:
 
 
 def _find_traj_npz_by_episode(root: str, ds: int, seed: int) -> Dict[str, Dict[int, str]]:
+    """Like `_find_traj_npz`, but indexed as method -> episode index -> path."""
     out: Dict[str, Dict[int, str]] = {}
 
     ppo_pattern = os.path.join(root, "**", f"seed{seed}", "ppo_only_ep*.npz")
@@ -385,6 +377,11 @@ def plot_trajectories_per_episode_for_ds_seed(
     *,
     max_episodes_per_method: int = 1,
 ):
+    """Save one figure per episode index, overlaying all methods for that episode.
+
+    Only the first `max_episodes_per_method` episode indices are plotted.
+    Returns the list of saved paths.
+    """
     found = _find_traj_npz_by_episode(root=root, ds=int(ds), seed=int(seed))
     if len(found) == 0:
         print(f"[WARN] No trajectory npz found for ds={ds}, seed={seed}")
@@ -506,6 +503,7 @@ def plot_trajectories_per_episode_for_ds_seed(
 # ============================================================================
 
 def _find_results_csv(root: str) -> List[str]:
+    """Return all <root>/ds*/seed*/results.csv paths."""
     pattern = os.path.join(root, "ds*", "seed*", "results.csv")
     return sorted(glob.glob(pattern))
 
@@ -517,6 +515,7 @@ def _safe_read_csv(path: str) -> pd.DataFrame:
 
 
 def _infer_ds_seed_from_path(path: str) -> Tuple[Optional[int], Optional[int]]:
+    """Parse dataset size and seed from `ds{N}` / `seed{N}` path components."""
     parts = path.replace("\\", "/").split("/")
     ds = None
     seed = None
@@ -545,6 +544,10 @@ def _looks_numeric_series(s: pd.Series) -> bool:
 
 
 def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure method/dataset_trajs/seed columns exist and cast the other columns to numeric.
+
+    Missing columns are taken from known aliases or parsed from the source path.
+    """
     out = df.copy()
 
     if "method" not in out.columns:
@@ -592,9 +595,9 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 
 def _aggregate_absolute(df_all: pd.DataFrame, metrics: List[str]) -> pd.DataFrame:
-    """
-    Aggregate absolute metrics over seeds for each (dataset_trajs, method).
-    If duplicates exist within a seed, average them first.
+    """Mean, std (ddof=1) and n_seeds of each metric per (dataset_trajs, method).
+
+    Multiple rows for the same seed are averaged first.
     """
     present_metrics = [m for m in metrics if m in df_all.columns]
     keep_cols = ["dataset_trajs", "seed", "method"] + present_metrics
@@ -645,11 +648,10 @@ def _aggregate_delta_vs_baseline(
     metrics: List[str],
     baseline_method: str = "ppo_only",
 ) -> pd.DataFrame:
-    """
-    Build paired deltas seed-by-seed:
-        delta_metric = metric(method, ds, seed) - metric(baseline, ds, seed)
+    """Paired deltas against the baseline, aggregated over seeds.
 
-    Then aggregate deltas across seeds for each (dataset_trajs, method).
+    delta_m = m(method, ds, seed) - m(baseline, ds, seed), computed only for seeds where
+    both are present; returns mean, std and n_seeds per (dataset_trajs, method).
     """
     present_metrics = [m for m in metrics if m in df_all.columns]
     keep_cols = ["dataset_trajs", "seed", "method"] + present_metrics
@@ -705,6 +707,7 @@ def _aggregate_delta_vs_baseline(
 
 
 def _pick_metric(agg_cols, preferred: str, fallback: str) -> Optional[str]:
+    """Return `preferred` if present, else `fallback` if present, else None."""
     if preferred in agg_cols:
         return preferred
     if fallback in agg_cols:
@@ -713,12 +716,10 @@ def _pick_metric(agg_cols, preferred: str, fallback: str) -> Optional[str]:
 
 
 def _compute_yerr(sub: pd.DataFrame, metric: str, band_mode: str = "none") -> Optional[np.ndarray]:
-    """
-    band_mode:
-      - none : no band
-      - std  : standard deviation
-      - sem  : standard error
-      - ci95 : 95% confidence interval ~= 1.96 * sem
+    """Half-width of the shaded band for `metric`, or None.
+
+    band_mode: none, std (standard deviation), sem (standard error) or
+    ci95 (1.96 * sem, normal approximation).
     """
     if band_mode == "none":
         return None
@@ -751,6 +752,7 @@ def _compute_yerr(sub: pd.DataFrame, metric: str, band_mode: str = "none") -> Op
 # ============================================================================
 
 def _ordered_methods(agg: pd.DataFrame, include_baseline: bool = True) -> List[str]:
+    """Plot order: baseline, styled methods, unstyled methods, then USER_METHODS_LAST."""
     present = set(agg["method"].unique().tolist())
 
     baseline = [BASELINE_METHOD] if include_baseline and BASELINE_METHOD in present else []
@@ -771,6 +773,7 @@ def _ordered_methods(agg: pd.DataFrame, include_baseline: bool = True) -> List[s
 
 
 def _add_y_headroom(ax, top_frac: float = 0.10, bottom_frac: float = 0.03) -> None:
+    """Expand the y-limits by the given fractions of the current range."""
     ymin, ymax = ax.get_ylim()
     yr = ymax - ymin
     if not np.isfinite(ymin) or not np.isfinite(ymax) or yr <= 0:
@@ -790,6 +793,7 @@ def _plot_metric(
     include_baseline: bool = True,
     xlabel: str = DEFAULT_XLABEL,
 ) -> None:
+    """Plot one metric against dataset size for all methods and save it as SVG."""
     methods = _ordered_methods(agg, include_baseline=include_baseline)
     ds_values = sorted(agg["dataset_trajs"].unique().tolist())
 
@@ -886,6 +890,7 @@ def _plot_panel(
     include_baseline: bool,
     zero_line: bool = False,
 ) -> None:
+    """Draw one metric against dataset size on `ax`; shows a placeholder if it is missing."""
     if metric is None or metric not in agg.columns:
         ax.axis("off")
         ax.text(0.5, 0.5, f"Missing metric:\n{metric}", ha="center", va="center")
@@ -954,12 +959,12 @@ def plot_main_figure_4panel(
     abs_band_mode: str = "none",
     delta_band_mode: str = "ci95",
 ) -> None:
-    """
-    4-panel figure:
-      A) Success@H (absolute)
-      B) Median steps-to-success (absolute, if available)
-      C) Mean improvement vs baseline (delta)
-      D) Tail safety (delta CVaR or delta P(Δ<0), if available)
+    """Save the 2x2 main figure.
+
+    Panels: A) success rate, B) median steps to success (absolute); C) mean return delta
+    and D) tail delta (CVaR_0.15 or P(delta < 0), selected by `tail_mode`) against the
+    baseline. Budget-return deltas are used when present. Missing metrics leave the
+    panel empty.
     """
     if xlabel is None:
         xlabel = DEFAULT_XLABEL
@@ -1064,6 +1069,7 @@ def plot_main_figure_4panel(
 # ============================================================================
 
 def main() -> None:
+    """Command-line entry point."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", type=str, required=True, help="Root folder containing ds*/seed*/results.csv")
     ap.add_argument(
@@ -1183,10 +1189,9 @@ def main() -> None:
     else:
         metrics = [m.strip() for m in metrics_arg.split(",") if m.strip()]
 
-    # Absolute aggregation over methods/seeds
     agg_abs = _aggregate_absolute(df_all, metrics=metrics)
 
-    # Delta aggregation only for core metrics usually used in comparisons
+    # Paired deltas are computed for the core metrics only.
     delta_metrics_candidates = ["return_mean", "cvar15", "success_rate"]
     delta_metrics = [m for m in delta_metrics_candidates if m in df_all.columns]
 
@@ -1196,7 +1201,7 @@ def main() -> None:
         baseline_method=str(args.baseline_method),
     )
 
-    # Save CSVs
+    # aggregated_results.csv and aggregated_results_absolute.csv hold the same table.
     agg_csv_legacy = os.path.join(outdir, "aggregated_results.csv")
     agg_abs_csv = os.path.join(outdir, "aggregated_results_absolute.csv")
     agg_delta_csv = os.path.join(
@@ -1212,7 +1217,6 @@ def main() -> None:
     print(f"[SAVED] {agg_abs_csv}")
     print(f"[SAVED] {agg_delta_csv}")
 
-    # Main 4-panel figure
     if int(args.make_main_figure) == 1:
         plot_main_figure_4panel(
             agg_abs=agg_abs,
@@ -1226,7 +1230,7 @@ def main() -> None:
         )
 
     # ---------------------------------------------------------------------
-    # Absolute plots (backward-compatible names)
+    # Absolute plots
     # ---------------------------------------------------------------------
     if "return_mean" in agg_abs.columns:
         _plot_metric(
@@ -1271,7 +1275,7 @@ def main() -> None:
         )
 
     # ---------------------------------------------------------------------
-    # Delta-vs-baseline plots (paired seed-by-seed)
+    # Paired delta-vs-baseline plots
     # ---------------------------------------------------------------------
     if "delta_return_mean" in agg_delta.columns:
         _plot_metric(
@@ -1315,7 +1319,7 @@ def main() -> None:
             xlabel=DEFAULT_XLABEL,
         )
 
-    # ---- optional trajectory plots ----
+    # Trajectory plots
     if int(args.plot_trajs) == 1:
         traj_outdir = (
             os.path.abspath(args.traj_outdir)

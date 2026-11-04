@@ -1,25 +1,28 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
+"""Domain adapters that build environments and infer their observation/action specs."""
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple, Optional
 import numpy as np
 import gymnasium as gym
 
-# PointMaze factory already in your repo
 from safe_rl.envs.pointmaze_factory import make_pointmaze_env
 
 try:
     import gymnasium_robotics  # noqa: F401
 except Exception:
-    # ok if user doesn't run PointMaze
+    # Only required for PointMaze.
     pass
 
 
 @dataclass
 class EnvSpec:
+    """Static description of an environment used by the experiment drivers."""
+
     env_id: str
     obs_kind: str                 # "dict_goal" or "vec"
     max_steps: int
@@ -28,10 +31,14 @@ class EnvSpec:
 
 
 class DomainAdapter:
+    """Base adapter: subclasses implement `make_env`."""
+
     def make_env(self, seed: int, continuing_task: bool, reward_type: str, disable_env_checker: bool = True):
+        """Create a seeded environment instance."""
         raise NotImplementedError
 
     def infer_spec(self, seed: int, continuing_task: bool, reward_type: str) -> EnvSpec:
+        """Build a temporary env and read its spec; max_steps defaults to 1000 if unset."""
         env = self.make_env(seed, continuing_task, reward_type)
         try:
             obs, _ = env.reset(seed=seed)
@@ -49,16 +56,18 @@ class DomainAdapter:
 
     @staticmethod
     def clip_action(a: np.ndarray, low: np.ndarray, high: np.ndarray) -> np.ndarray:
+        """Flatten and clip an action to [low, high] as float32."""
         a = np.asarray(a, dtype=np.float32).ravel()
         return np.clip(a, low, high).astype(np.float32)
 
 
 class PointMazeAdapter(DomainAdapter):
+    """PointMaze environments built through `make_pointmaze_env`."""
+
     def __init__(self, env_id: str = "PointMaze_UMaze-v3"):
         self.env_id = env_id
 
     def make_env(self, seed: int, continuing_task: bool, reward_type: str, disable_env_checker: bool = True):
-        # your unified factory
         return make_pointmaze_env(
             seed=seed,
             continuing_task=continuing_task,
@@ -68,15 +77,12 @@ class PointMazeAdapter(DomainAdapter):
 
 
 class MujocoAdapter(DomainAdapter):
-    """
-    For Hopper/Walker2d via gymnasium MuJoCo envs (e.g., Hopper-v4, Walker2d-v4).
-    Uses standard gym.make.
-    """
+    """Gymnasium MuJoCo environments (e.g. Hopper-v4, Walker2d-v4) built with `gym.make`."""
     def __init__(self, env_id: str):
         self.env_id = env_id
 
     def make_env(self, seed: int, continuing_task: bool, reward_type: str, disable_env_checker: bool = True):
-        # continuing_task/reward_type not used by these envs; kept for unified CLI.
+        # continuing_task and reward_type are unused here; kept for a uniform interface.
         env = gym.make(self.env_id, disable_env_checker=disable_env_checker)
         env.reset(seed=seed)
         return env

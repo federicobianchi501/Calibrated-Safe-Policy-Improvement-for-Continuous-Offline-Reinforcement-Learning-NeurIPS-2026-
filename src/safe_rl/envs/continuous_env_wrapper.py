@@ -1,12 +1,12 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-"""
-continuous_env_wrapper.py — Clone/restore wrapper for flat-obs MuJoCo envs.
+"""Clone/restore wrapper for MuJoCo environments with flat observations.
 
-Works for Walker2d-v5, Hopper-v5 (and any MuJoCo env with .model/.data).
-Returns flat numpy observations (standard gymnasium API).
+Applies to any gymnasium MuJoCo env exposing `.model` and `.data` (Hopper, HalfCheetah,
+Walker2d, Ant). Observations are passed through unchanged.
 """
 import copy
 from typing import Any, Dict, Optional
@@ -17,6 +17,7 @@ from gymnasium import Wrapper
 
 
 def _find_timelimit_wrapper(env) -> Optional[Any]:
+    """Return the first wrapper in the chain that holds a TimeLimit step counter, or None."""
     cur = env
     while cur is not None:
         if hasattr(cur, "_elapsed_steps"):
@@ -26,11 +27,9 @@ def _find_timelimit_wrapper(env) -> Optional[Any]:
 
 
 class ContinuousEnvWrapper(Wrapper):
-    """
-    Clone/restore wrapper for continuous MuJoCo environments.
+    """Snapshot and restore of MuJoCo physics, TimeLimit counter and env RNG.
 
-    Identical clone/restore logic to CloneablePointMazeWrapper but without
-    goal-tracking (Walker2d, Hopper have flat obs with no goal structure).
+    Same clone/restore logic as CloneablePointMazeWrapper, without goal state.
     """
 
     def __init__(self, env):
@@ -42,7 +41,7 @@ class ContinuousEnvWrapper(Wrapper):
         self._state_size = mujoco.mj_stateSize(self.model, self._state_spec)
 
     def clone_state(self) -> Dict[str, Any]:
-        """Return a snapshot of the full MuJoCo physics state."""
+        """Return a snapshot of the full physics state, step counter and RNG state."""
         mj_state = np.zeros(self._state_size, dtype=np.float64)
         mujoco.mj_getState(self.model, self.data, mj_state, self._state_spec)
 
@@ -64,7 +63,7 @@ class ContinuousEnvWrapper(Wrapper):
         }
 
     def restore_state(self, snapshot: Dict[str, Any]) -> None:
-        """Restore physics state from a snapshot."""
+        """Restore a snapshot produced by `clone_state` and recompute derived quantities."""
         mujoco.mj_setState(
             self.model, self.data, snapshot["mj_state"], self._state_spec
         )

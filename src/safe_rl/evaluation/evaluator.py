@@ -1,20 +1,16 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-# evaluator_fixed.py
+"""Episodic evaluation of a policy on PointMaze with flattened observations."""
 import numpy as np
 import gymnasium as gym
 from safe_rl.envs.wrappers import FlattenPointMazeObs
 
 
 def make_pointmaze_env(seed=None):
-    """
-    Create a fresh evaluation environment.
-    PointMaze is wrapped with FlattenPointMazeObs so PPO/MCTS see a flat Box obs.
-
-    This function is used in every episode (no VecEnv).
-    """
+    """Create a PointMaze UMaze env with flat Box observations (FlattenPointMazeObs)."""
     env = gym.make("PointMaze_UMaze-v3", disable_env_checker=True)
 
     if seed is not None:
@@ -31,19 +27,15 @@ def evaluate_policy_pointmaze(
     success_threshold=0.5,
     seed=12345
 ):
-    """
-    Evaluate any deterministic or stochastic policy (PPO, MCTS wrapper, etc.)
-    on PointMaze with research-grade metrics used in literature.
+    """Evaluate `model.predict(obs, deterministic=True)` on PointMaze.
 
-    Metrics returned:
-        - mean_return
-        - std_return
-        - success_rate
-        - final_distance_mean
-        - final_distance_std
-        - returns (list)
-        - distances (list)
-        - success (list of 0/1)
+    Each episode uses a fresh env seeded from `seed`. An episode ends on success
+    (goal distance < `success_threshold`), termination, truncation or `max_steps`.
+
+    Returns:
+        Dict with mean_return, std_return, success_rate, final_distance_mean,
+        final_distance_std and the per-episode lists returns, distances, success (0/1).
+        The final distance is 999.0 when the env reports no goal information.
     """
 
     returns = []
@@ -54,7 +46,7 @@ def evaluate_policy_pointmaze(
 
     for ep in range(episodes):
 
-        # fresh environment for each episode, with reproducible seed
+        # Fresh env per episode, seeded from the evaluation RNG.
         env = make_pointmaze_env(seed=int(rng.integers(0, 1e9)))
         obs, info = env.reset()
         desired_goal = info.get("desired_goal")
@@ -64,28 +56,25 @@ def evaluate_policy_pointmaze(
 
         for t in range(max_steps):
 
-            # Policy prediction
             action, _ = model.predict(obs, deterministic=True)
 
-            # Step environment
             obs, reward, terminated, truncated, info = env.step(action)
             ep_ret += float(reward)
 
             achieved = info.get("achieved_goal")
             dg = info.get("desired_goal", desired_goal)
 
-            # Compute distance every step
             if achieved is not None and dg is not None:
                 final_dist = float(np.linalg.norm(achieved - dg))
 
-            # STOP EARLY IF SUCCESS
+            # Stop early on success.
             if final_dist is not None and final_dist < success_threshold:
                 break
 
             if terminated or truncated:
                 break
 
-        # If no valid distance was extracted (should not happen), set large value
+        # No goal information in info: record a large distance.
         if final_dist is None:
             final_dist = 999.0
 

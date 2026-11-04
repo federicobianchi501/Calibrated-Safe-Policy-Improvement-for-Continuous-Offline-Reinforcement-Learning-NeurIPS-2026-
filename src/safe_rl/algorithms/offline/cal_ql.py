@@ -1,34 +1,20 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-"""
-cal_ql.py — Calibrated Q-Learning (Nakamoto et al., 2023)
-arXiv:2303.05479
+"""Calibrated Q-Learning (Nakamoto et al., NeurIPS 2023, arXiv:2303.05479).
 
-Cal-QL addresses over-conservatism in CQL by adding a calibration loss
-that prevents Q-values from being pushed below the empirical Monte Carlo
-return computed from the offline dataset:
+CQL plus a one-sided penalty that keeps Q above a k-step discounted return
+R_MC(s, a) computed from the dataset:
+    Q_loss = CQL_loss + lambda_cal * E_D[max(0, R_MC(s, a) - Q(s, a))^2],
+    R_MC[i] = sum_{j<k} gamma^j r[i+j], truncated at the first terminal (no bootstrap).
 
-  Q_loss = CQL_loss + λ_cal * E_{(s,a)~D}[ max(0, R_MC(s,a) - Q(s,a))^2 ]
+    agent = CalQLAgent(obs_dim, act_dim, cfg)
+    agent.train(dataset, n_epochs=200)
+    action = agent.act(obs)
 
-where R_MC(s,a) = Σ_{t=0}^{k-1} γ^t r_{t+τ} + γ^k V(s_{τ+k}) is the
-k-step Monte Carlo return starting from (s,a) in the trajectory.
-
-This calibration ensures Q(s,a) ≥ R_MC(s,a) at data points, preventing
-under-estimation of good actions while keeping the CQL upper bound.
-
-Interface (identical to IQL/CQL):
-  agent = CalQLAgent(obs_dim, act_dim, cfg)
-  agent.train(dataset, n_epochs=200)
-  action = agent.act(obs_dict)
-
-Hyperparameters follow the original paper (Table 1 / Table 3):
-  Base CQL: alpha_cql=5.0 (same as CQL for both maze and locomotion)
-  Calibration:
-    k_mc=5 (locomotion); k_mc=10 (maze/antmaze)
-    lambda_cal=1.0 (paper: fixed across tasks)
-    alpha_sac: same as CQL (0.05 locomotion, 0.1 maze)
+CQL hyperparameters are inherited from CQLConfig; k_mc=5 (locomotion) or 10 (maze).
 """
 from __future__ import annotations
 
@@ -39,7 +25,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# Reuse CQL building blocks (same architecture family)
 from safe_rl.algorithms.offline.cql import (
     CQLAgent,
     CQLConfig,
@@ -55,19 +40,9 @@ from safe_rl.algorithms.offline.cql import (
 
 @dataclass
 class CalQLConfig(CQLConfig):
-    """
-    Cal-QL config extends CQL config with calibration hyperparameters.
-
-    Inherits all CQL fields:
-      hidden_dim, n_hidden, lr, batch_size, gamma, tau,
-      alpha_sac, alpha_cql, n_action_samples, normalize_states, device, seed
-
-    Additional fields:
-      k_mc      : steps for MC return estimate (paper: 5 locomotion, 10 maze)
-      lambda_cal: weight of calibration loss    (paper: 1.0)
-    """
-    k_mc:       int   = 5      # locomotion default; set 10 for PointMaze
-    lambda_cal: float = 1.0    # calibration loss weight (paper: fixed at 1.0)
+    """CQLConfig plus the calibration horizon k_mc and loss weight lambda_cal."""
+    k_mc:       int   = 5      # 10 for maze domains
+    lambda_cal: float = 1.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -76,19 +51,14 @@ class CalQLConfig(CQLConfig):
 
 def _compute_mc_returns(
     rewards:  np.ndarray,   # [N]
-    dones:    np.ndarray,   # [N]  (1.0 at terminal steps)
+    dones:    np.ndarray,   # [N], 1.0 at terminal steps
     gamma:    float,
     k:        int,
 ) -> np.ndarray:
-    """
-    Compute k-step discounted Monte Carlo returns for every transition i:
+    """k-step discounted returns R_MC[i] = sum_{j<k} gamma^j r[i+j], float32 [N].
 
-      R_MC[i] = Σ_{j=0}^{k-1} γ^j · r[i+j]  (truncated at episode boundary)
-
-    For transitions close to the end of an episode, the sum is truncated
-    when a terminal step is encountered (done[i+j] = 1).
-
-    Returns R_MC as a float32 array of shape [N].
+    Transitions are assumed to be stored in trajectory order. The sum stops
+    after the first step with done = 1 or at the end of the array.
     """
     N = len(rewards)
     R_mc = np.zeros(N, dtype=np.float32)
@@ -100,7 +70,7 @@ def _compute_mc_returns(
                 break
             cumret += disc * rewards[i + j]
             disc   *= gamma
-            if dones[i + j] > 0.5:       # episode boundary
+            if dones[i + j] > 0.5:
                 break
         R_mc[i] = cumret
     return R_mc
@@ -111,12 +81,7 @@ def _compute_mc_returns(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CalQLAgent(CQLAgent):
-    """
-    Calibrated Q-Learning agent for continuous-action offline RL.
-
-    Extends CQLAgent with a calibration loss that prevents Q-values from
-    dropping below the k-step Monte Carlo return at data points.
-    """
+    """CQLAgent with a penalty on Q falling below R_MC at dataset (s, a)."""
 
     def __init__(
         self,
@@ -124,9 +89,8 @@ class CalQLAgent(CQLAgent):
         act_dim: int,
         cfg: Optional[CalQLConfig] = None,
     ):
-        # Use CalQLConfig defaults if no config provided
         cal_cfg = cfg if cfg is not None else CalQLConfig()
-        # Convert to CalQLConfig if a bare CQLConfig was passed
+        # A plain CQLConfig is upgraded to CalQLConfig with default calibration fields.
         if type(cal_cfg) is CQLConfig:
             cal_cfg = CalQLConfig(**{k: v for k, v in vars(cal_cfg).items()
                                     if k in CalQLConfig.__dataclass_fields__})
@@ -134,17 +98,14 @@ class CalQLAgent(CQLAgent):
         self.cfg: CalQLConfig = cal_cfg
         self.loss_history["cal"] = []
 
-        # Calibration targets computed once in train()
         self._R_mc_tensor: Optional[torch.Tensor] = None
 
     # ── training ──────────────────────────────────────────────────────────────
 
     def train(self, dataset: Dict[str, Any], n_epochs: int = 200) -> None:
-        """
-        Train Cal-QL on the offline dataset.
+        """Train on an offline transition dict; each epoch is one gradient step.
 
-        Extends CQL training by pre-computing k-step MC returns and
-        adding a calibration loss at each gradient step.
+        R_MC is computed once from the unshuffled dataset before training.
         """
         S, A, R, S2, D = self._dataset_to_tensors(dataset)
         N = S.shape[0]
@@ -164,7 +125,6 @@ class CalQLAgent(CQLAgent):
             S  = (S  - self.state_mean) / self.state_std
             S2 = (S2 - self.state_mean) / self.state_std
 
-        # ── Pre-compute k-step MC returns ────────────────────────────────────
         r_np = R.cpu().numpy()
         d_np = D.cpu().numpy()
         R_mc_np = _compute_mc_returns(r_np, d_np, self.cfg.gamma, self.cfg.k_mc)
@@ -178,7 +138,7 @@ class CalQLAgent(CQLAgent):
             s, a, r, s2, d = S[idx], A[idx], R[idx], S2[idx], D[idx]
             r_mc = R_mc[idx]
 
-            # ── SAC backup ───────────────────────────────────────────────────
+            # Soft Bellman target.
             with torch.no_grad():
                 a2, lp2 = self.actor.sample(s2)
                 q2_min  = self.q_tgt.min(s2, a2)
@@ -187,15 +147,14 @@ class CalQLAgent(CQLAgent):
             q1, q2 = self.q_net(s, a)
             q_std_loss = F.mse_loss(q1, q_tgt) + F.mse_loss(q2, q_tgt)
 
-            # ── CQL conservative term ────────────────────────────────────────
+            # Conservative term, applied to each Q head.
             cql1 = self._cql_term(
                 lambda ss, aa: self.q_net(ss, aa)[0], s, a)
             cql2 = self._cql_term(
                 lambda ss, aa: self.q_net(ss, aa)[1], s, a)
             cql_loss = self.cfg.alpha_cql * (cql1 + cql2)
 
-            # ── Calibration loss: push Q ≥ R_MC ─────────────────────────────
-            # F.relu(x) = max(0, x): only penalise Q < R_MC (Nakamoto eq. 5)
+            # Calibration: penalize only Q < R_MC.
             cal1 = F.relu(r_mc - q1).pow(2).mean()
             cal2 = F.relu(r_mc - q2).pow(2).mean()
             cal_loss = self.cfg.lambda_cal * (cal1 + cal2)
@@ -205,7 +164,7 @@ class CalQLAgent(CQLAgent):
             q_loss.backward()
             self.q_opt.step()
 
-            # ── SAC actor update ─────────────────────────────────────────────
+            # SAC actor update.
             a_new, lp_new = self.actor.sample(s)
             q_new_min     = self.q_net.min(s, a_new)
             a_loss        = (α_s * lp_new - q_new_min).mean()

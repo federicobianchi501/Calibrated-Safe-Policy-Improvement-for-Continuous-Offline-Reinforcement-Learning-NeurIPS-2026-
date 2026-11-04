@@ -1,7 +1,9 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
+"""Factory for the PointMaze UMaze environment used for data collection, planning and eval."""
 import gymnasium as gym
 from safe_rl.envs.cloneable_pointmaze_wrapper import CloneablePointMazeWrapper
 
@@ -19,12 +21,14 @@ def make_pointmaze_env(
     step_penalty: float = 1.0,
     dist_penalty: float = 0.2,
 ):
-    """
-    Factory for PointMaze env. Use this everywhere (train, eval, MCTS).
+    """Create a seeded PointMaze UMaze env wrapped in CloneablePointMazeWrapper.
 
-    FIXED: Removed wall_penalty parameter.
-    wall_penalty was removed because the model env cannot mirror it,
-    creating a reward mismatch between real env and learned model.
+    Args:
+        seed: seed for env reset and for the action/observation spaces.
+        continuing_task: if True, a new goal is sampled after each success.
+        reward_type: "sparse" (PointMaze_UMaze-v3) or "dense" (PointMaze_UMazeDense-v3).
+        living_cost, success_bonus, reward_mode, step_penalty, dist_penalty: reward
+            shaping passed to CloneablePointMazeWrapper.
     """
     global _REGISTERED
 

@@ -1,16 +1,16 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
 """
-Numba-accelerated ensemble dynamics + PPO actor forward passes.
+Numba forward passes for the dynamics ensemble and the PPO actor.
 
-Purpose: avoid per-call torch overhead inside the MCTS hot loop. We extract
-weights from the trained torch modules into flat numpy arrays and provide
-njit forward functions that match the torch output within float32 rounding.
-
-Not a replacement for training: EnsembleDynamicsSB3 and PPO still own
-training and serialization. This module is read-only at planning time.
+Weights of a fitted EnsembleDynamicsSB3 and an SB3 PPO policy are copied into
+float32 numpy arrays; njit kernels compute per-member deltas, USAD and the
+deterministic PPO action. Kernels are compiled with fastmath, so outputs
+match torch up to float32 rounding. Training and serialization stay with the
+torch modules.
 """
 
 from __future__ import annotations
@@ -29,11 +29,13 @@ from numba import njit
 
 @dataclass
 class EnsembleNumbaWeights:
+    """Float32 weights and input normalization of a K-member MLP ensemble."""
+
     # K members. Each member is an MLP with `n_hidden` hidden layers:
     #   2 hidden: in -> H1 -> H2 -> obs_dim                  (3 Linear)
     #   3 hidden: in -> H1 -> H2 -> H3 -> obs_dim            (4 Linear)
     #   4 hidden: in -> H1 -> H2 -> H3 -> H4 -> obs_dim      (5 Linear)
-    # W3/b3 are always the OUTPUT linear (going into obs_dim).
+    # W3/b3 are always the output layer (into obs_dim).
     # W_mid/b_mid carry the third hidden layer when n_hidden in {3,4}.
     # W_mid2/b_mid2 carry the fourth hidden layer when n_hidden==4.
     # Unused mid arrays are zero-shaped sentinels (K,0,0) / (K,0).
@@ -59,6 +61,8 @@ class EnsembleNumbaWeights:
 
 @dataclass
 class PPOActorNumbaWeights:
+    """Float32 weights of the SB3 PPO actor mean network."""
+
     # actor: Linear(obs_dim->H1) + Tanh + Linear(H1->H2) + Tanh + Linear(H2->act_dim)
     W1: np.ndarray  # [H1, obs_dim]
     b1: np.ndarray  # [H1]
@@ -181,7 +185,7 @@ def extract_ensemble_weights(ens: Any) -> EnsembleNumbaWeights:
 
 def extract_ppo_actor_weights(ppo: Any) -> PPOActorNumbaWeights:
     """
-    Read the deterministic mean head of a SB3 PPO ActorCriticPolicy.
+    Read the deterministic mean head of an SB3 PPO ActorCriticPolicy.
 
     Expected structure:
         policy.mlp_extractor.policy_net[0] = Linear(obs_dim, H1)
@@ -189,8 +193,6 @@ def extract_ppo_actor_weights(ppo: Any) -> PPOActorNumbaWeights:
         policy.mlp_extractor.policy_net[2] = Linear(H1, H2)
         policy.mlp_extractor.policy_net[3] = Tanh
         policy.action_net               = Linear(H2, act_dim)
-
-    Raises if the structure does not match (no silent fallback).
     """
     pnet = ppo.policy.mlp_extractor.policy_net
     lin1 = pnet[0]
@@ -218,7 +220,7 @@ def extract_ppo_actor_weights(ppo: Any) -> PPOActorNumbaWeights:
 # ---------------------------------------------------------------------------
 
 
-@njit(cache=True, fastmath=False, inline="always")
+@njit(cache=True, fastmath=True, inline="always")
 def _linear_relu(x, W, b, out):
     # out = relu(W @ x + b);  W: [H, D], x: [D], b: [H], out: [H]
     H = W.shape[0]
@@ -230,8 +232,9 @@ def _linear_relu(x, W, b, out):
         out[i] = s if s > 0.0 else 0.0
 
 
-@njit(cache=True, fastmath=False, inline="always")
+@njit(cache=True, fastmath=True, inline="always")
 def _linear_tanh(x, W, b, out):
+    # out = tanh(W @ x + b)
     H = W.shape[0]
     D = W.shape[1]
     for i in range(H):
@@ -241,8 +244,9 @@ def _linear_tanh(x, W, b, out):
         out[i] = np.tanh(s)
 
 
-@njit(cache=True, fastmath=False, inline="always")
+@njit(cache=True, fastmath=True, inline="always")
 def _linear(x, W, b, out):
+    # out = W @ x + b
     H = W.shape[0]
     D = W.shape[1]
     for i in range(H):
@@ -252,7 +256,7 @@ def _linear(x, W, b, out):
         out[i] = s
 
 
-@njit(cache=True, fastmath=False)
+@njit(cache=True, fastmath=True)
 def ensemble_forward_all(
     obs, action,
     W1, b1, W2, b2, W3, b3,
@@ -261,10 +265,10 @@ def ensemble_forward_all(
     _h1_buf, _h2_buf, _x_buf,
 ):
     """
-    Compute per-member delta predictions into deltas_out [K, obs_dim].
+    Per-member delta predictions of a 2-hidden-layer ensemble.
 
-    Buffers (_h1_buf, _h2_buf, _x_buf) are passed in to avoid per-call
-    allocation inside the hot loop. Caller owns them.
+    Writes deltas_out [K, obs_dim]. Input is (obs, action), normalized when
+    `has_norm`. Scratch buffers (_h1_buf, _h2_buf, _x_buf) are caller-owned.
     """
     K = W1.shape[0]
     in_dim = W1.shape[2]
@@ -292,7 +296,7 @@ def ensemble_forward_all(
             deltas_out[k, i] = s
 
 
-@njit(cache=True, fastmath=False)
+@njit(cache=True, fastmath=True)
 def ensemble_forward_all_3h(
     obs, action,
     W1, b1, W2, b2, W_mid, b_mid, W3, b3,
@@ -301,10 +305,9 @@ def ensemble_forward_all_3h(
     _h1_buf, _h2_buf, _h3_buf, _x_buf,
 ):
     """
-    Same contract as ensemble_forward_all but for 3-hidden-layer MLPs.
+    `ensemble_forward_all` for 3-hidden-layer MLPs.
 
-    Forward: x -> W1 -> ReLU -> W2 -> ReLU -> W_mid -> ReLU -> W3 -> deltas.
-    Caller owns the buffers (_h1_buf, _h2_buf, _h3_buf, _x_buf).
+    x -> W1 -> ReLU -> W2 -> ReLU -> W_mid -> ReLU -> W3 -> deltas.
     """
     K = W1.shape[0]
     in_dim = W1.shape[2]
@@ -331,7 +334,7 @@ def ensemble_forward_all_3h(
             deltas_out[k, i] = s
 
 
-@njit(cache=True, fastmath=False)
+@njit(cache=True, fastmath=True)
 def ensemble_forward_all_4h(
     obs, action,
     W1, b1, W2, b2, W_mid, b_mid, W_mid2, b_mid2, W3, b3,
@@ -340,10 +343,9 @@ def ensemble_forward_all_4h(
     _h1_buf, _h2_buf, _h3_buf, _h4_buf, _x_buf,
 ):
     """
-    Same contract as ensemble_forward_all but for 4-hidden-layer MLPs.
+    `ensemble_forward_all` for 4-hidden-layer MLPs.
 
-    Forward: x -> W1 -> ReLU -> W2 -> ReLU -> W_mid -> ReLU -> W_mid2 -> ReLU -> W3 -> deltas.
-    Caller owns the buffers (_h1_buf, _h2_buf, _h3_buf, _h4_buf, _x_buf).
+    x -> W1 -> ReLU -> W2 -> ReLU -> W_mid -> ReLU -> W_mid2 -> ReLU -> W3 -> deltas.
     """
     K = W1.shape[0]
     in_dim = W1.shape[2]
@@ -371,7 +373,7 @@ def ensemble_forward_all_4h(
             deltas_out[k, i] = s
 
 
-@njit(cache=True, fastmath=False)
+@njit(cache=True, fastmath=True)
 def usad_from_deltas(deltas):
     """max_{i<j} ||deltas[i] - deltas[j]||_2. deltas: [K, D]."""
     K = deltas.shape[0]
@@ -388,7 +390,7 @@ def usad_from_deltas(deltas):
     return np.sqrt(maxd)
 
 
-@njit(cache=True, fastmath=False)
+@njit(cache=True, fastmath=True)
 def mean_delta_from_deltas(deltas, out):
     """out = mean_k deltas[k]. deltas: [K, D], out: [D]."""
     K = deltas.shape[0]
@@ -401,7 +403,7 @@ def mean_delta_from_deltas(deltas, out):
         out[d] = s * inv
 
 
-@njit(cache=True, fastmath=False)
+@njit(cache=True, fastmath=True)
 def ppo_actor_mean(
     obs,
     W1, b1, W2, b2, W3, b3,
@@ -409,11 +411,10 @@ def ppo_actor_mean(
     _h1_buf, _h2_buf,
 ):
     """
-    Forward pass of the PPO actor mean (Tanh activations).
+    PPO actor mean (Tanh activations), written into `out`.
 
-    Writes the deterministic action into `out`, clipped to [-1, 1] to match
-    the behaviour of SB3 `PPO.predict(..., deterministic=True)`, which clips
-    to `action_space.low/high` (here [-1, 1] for the MuJoCo locomotion envs).
+    Clipped to [-1, 1], as `PPO.predict(..., deterministic=True)` clips to the
+    action space bounds.
     """
     _linear_tanh(obs, W1, b1, _h1_buf)
     _linear_tanh(_h1_buf, W2, b2, _h2_buf)
@@ -433,12 +434,10 @@ def ppo_actor_mean(
 
 class EnsembleNumbaProxy:
     """
-    Thin convenience wrapper that mirrors the three methods mcts_parametric
-    actually touches: _predict_all, uncertainty_usad, sample_next_obs_vec.
+    Ensemble interface used by mcts_parametric (_predict_all, uncertainty_usad,
+    sample_next_obs_vec) backed by the 2-hidden-layer numba kernel.
 
-    Intended for parity testing only. The njit MCTS does not go through
-    this class; it calls the kernels above directly with pre-allocated
-    buffers.
+    For one-off queries; the numba planners call the kernels directly.
     """
 
     def __init__(self, w: EnsembleNumbaWeights):
@@ -450,6 +449,7 @@ class EnsembleNumbaProxy:
         self._mean_delta = np.zeros((w.obs_dim,), dtype=np.float32)
 
     def _predict_all(self, obs, action) -> np.ndarray:
+        """Per-member deltas [K, obs_dim] (a copy)."""
         obs_np = np.asarray(obs, dtype=np.float32).reshape(-1)
         act_np = np.asarray(action, dtype=np.float32).reshape(-1)
         ensemble_forward_all(
@@ -461,11 +461,13 @@ class EnsembleNumbaProxy:
         return self._deltas.copy()
 
     def uncertainty_usad(self, obs, action) -> float:
+        """USAD disagreement at (obs, action)."""
         deltas = self._predict_all(obs, action)
         return float(usad_from_deltas(deltas))
 
     def sample_next_obs_vec(self, obs, action, *, model_index: Optional[int] = None,
                             rng: Optional[np.random.Generator] = None) -> np.ndarray:
+        """Next obs from member `model_index` (-1: ensemble mean; None: random)."""
         obs_np = np.asarray(obs, dtype=np.float32).reshape(-1)
         deltas = self._predict_all(obs_np, action)
         K = deltas.shape[0]

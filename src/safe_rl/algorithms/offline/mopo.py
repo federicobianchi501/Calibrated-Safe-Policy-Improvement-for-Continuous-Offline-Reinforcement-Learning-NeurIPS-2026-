@@ -1,28 +1,20 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-"""
-mopo.py — MOPO (Yu et al., NeurIPS 2020)
-arXiv:2005.05951
+"""Model-based Offline Policy Optimization (Yu et al., NeurIPS 2020, arXiv:2005.13239).
 
-Model-based Offline Policy Optimization with soft reward penalization.
+SAC on short model rollouts with the penalized reward r - lam * sigma(s, a).
 
-Uses a heteroscedastic NLL ensemble (correct for MOPO: soft penalty, NOT hard gate).
-Augments rewards: r_pen(s,a) = r(s,a) - lambda * sigma(s,a)
-where sigma is the ensemble's predictive standard deviation.
+  - MOPOAgent: fits its own heteroscedastic Gaussian NLL ensemble; sigma is
+    max_k ||std_k(s, a)||_2 over members. Reward is the PointMaze distance proxy.
+  - MOPOMSEAgent: reuses a trained MSE ensemble (the one used by Cal-SPI);
+    sigma is the epistemic std sqrt(mean_d Var_k[mu_k(s, a)_d]).
 
-Trains SAC on synthetic rollouts from the penalized model.
-
-Key differences vs Cal-SPI:
-  - NLL ensemble (heteroscedastic), NOT MSE   ← intentional for MOPO
-  - Soft reward penalty (not hard gate)
-  - SAC optimizer over synthetic data
-
-Interface:
-  agent = MOPOAgent(obs_dim, act_dim, cfg)
-  agent.train(dataset, n_epochs=200)
-  action = agent.act(obs_dict)
+    agent = MOPOAgent(obs_dim, act_dim, cfg)
+    agent.train(dataset, n_epochs=200)
+    action = agent.act(obs)
 """
 
 from __future__ import annotations
@@ -43,19 +35,21 @@ import torch.optim as optim
 
 @dataclass
 class MOPOConfig:
-    # Ensemble (NLL, heteroscedastic)
+    """Hyperparameters of the NLL ensemble, the penalized MDP and SAC."""
+
+    # Heteroscedastic NLL ensemble
     ensemble_size: int   = 4
     ensemble_hidden: int = 512
     ensemble_epochs: int = 50
     ensemble_lr:   float = 1e-3
     ensemble_batch:  int = 256
 
-    # P-MDP
-    lam:           float = 1.0    # penalty weight λ for sigma
+    # Penalized MDP
+    lam:           float = 1.0    # penalty weight on sigma
     rollout_length:  int = 5
     rollout_batch:   int = 1000
 
-    # SAC optimizer
+    # SAC
     hidden_dim:  int   = 256
     n_hidden:    int   = 2
     lr:          float = 3e-4
@@ -69,7 +63,7 @@ class MOPOConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NLL Ensemble (MOPO-style, heteroscedastic)
+# Heteroscedastic NLL ensemble
 # ─────────────────────────────────────────────────────────────────────────────
 
 LOG_STD_MIN = -10.0
@@ -77,7 +71,7 @@ LOG_STD_MAX = 2.0
 
 
 class NLLMember(nn.Module):
-    """Single ensemble member: outputs (mu, log_sigma^2) for NLL loss."""
+    """Ensemble member predicting (mu, log variance) of the state delta."""
     def __init__(self, in_dim: int, out_dim: int, hidden: int = 512):
         super().__init__()
         self.net = nn.Sequential(
@@ -95,10 +89,7 @@ class NLLMember(nn.Module):
 
 
 class NLLEnsemble:
-    """
-    Heteroscedastic NLL ensemble for MOPO.
-    NOTE: uses NLL (sigma learned), appropriate for soft penalty.
-    """
+    """Ensemble of diagonal-Gaussian delta models trained with Gaussian NLL."""
 
     def __init__(self, obs_dim: int, act_dim: int, cfg: MOPOConfig):
         self.obs_dim = obs_dim
@@ -118,7 +109,7 @@ class NLLEnsemble:
             self.optims.append(optim.Adam(m.parameters(), lr=cfg.ensemble_lr))
 
     def fit(self, obs: np.ndarray, act: np.ndarray, next_obs: np.ndarray) -> None:
-        """Train ensemble on transitions (obs, act) -> delta = next_obs - obs."""
+        """Fit every member on (obs, act) -> next_obs - obs with shared minibatches."""
         X = np.concatenate([obs, act], axis=-1).astype(np.float32)
         y = (next_obs - obs).astype(np.float32)
         N = X.shape[0]
@@ -134,17 +125,17 @@ class NLLEnsemble:
                 for m, opt in zip(self.members, self.optims):
                     opt.zero_grad()
                     mu, logvar = m(xb)
-                    # Gaussian NLL: 0.5*(logvar + (y-mu)^2/exp(logvar))
+                    # Gaussian NLL up to a constant.
                     loss = (0.5 * (logvar + ((yb - mu).pow(2) / logvar.exp()))).mean()
                     loss.backward()
                     opt.step()
 
     @torch.no_grad()
     def predict(self, obs: np.ndarray, act: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Returns (mu_bar, sigma_agg) where:
-          mu_bar: [B, obs_dim] — ensemble mean of means
-          sigma_agg: [B] — mean predictive std across members and dims
+        """Return (mu_bar, sigma_agg).
+
+        mu_bar: [B, obs_dim], mean over members of the predicted delta.
+        sigma_agg: [B], max over members of the L2 norm of the predicted std.
         """
         X = np.concatenate([obs, act], axis=-1).astype(np.float32)
         Xt = torch.as_tensor(X, device=self.device)
@@ -159,9 +150,7 @@ class NLLEnsemble:
         vars_= np.stack(vars_, axis=0)  # [E, B, d]
 
         mu_bar = mus.mean(axis=0)           # [B, d]
-        # MOPO penalty signal: max_k ||std_k(s,a)||_2  (Yu et al. 2020, Sec. 4, eq. 5)
-        # Uses the learned NLL predictive std of each member (aleatoric + epistemic).
-        # Each member predicts a diagonal Gaussian; ||std_k||_F = ||sqrt(exp(logvar_k))||_2.
+        # MOPO penalty: max_k ||std_k(s, a)||_2 of the learned per-member std.
         stds = np.sqrt(vars_)                               # [E, B, d]
         sigma_agg = np.linalg.norm(stds, axis=-1).max(axis=0)  # [B]
         return mu_bar, sigma_agg
@@ -170,11 +159,7 @@ class NLLEnsemble:
     def sample_step(
         self, obs: np.ndarray, act: np.ndarray, rng: np.random.Generator
     ) -> np.ndarray:
-        """
-        Sample next obs using a random member.
-        obs: [B, obs_dim], act: [B, act_dim]
-        Returns: [B, obs_dim]
-        """
+        """Sample next obs [B, obs_dim] from N(mu_k, std_k^2), member k drawn per sample."""
         B = obs.shape[0]
         X = np.concatenate([obs, act], axis=-1).astype(np.float32)
         Xt = torch.as_tensor(X, device=self.device)
@@ -186,7 +171,6 @@ class NLLEnsemble:
                 continue
             mu_k, logvar_k = m(Xt[mask])
             std_k = logvar_k.exp().sqrt()
-            # reparameterisation sample
             eps = torch.randn_like(mu_k)
             delta = (mu_k + std_k * eps).cpu().numpy()
             next_obs[mask] = obs[mask] + delta
@@ -194,7 +178,7 @@ class NLLEnsemble:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SAC helper networks (same as MORelFull)
+# SAC networks
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _mlp(in_dim: int, out_dim: int, hidden_dim: int, n_hidden: int) -> nn.Sequential:
@@ -208,6 +192,7 @@ def _mlp(in_dim: int, out_dim: int, hidden_dim: int, n_hidden: int) -> nn.Sequen
 
 
 class GaussianActor(nn.Module):
+    """Tanh-squashed Gaussian actor (SAC); forward returns (action, log_prob)."""
     LOG_STD_MIN = -5.0
     LOG_STD_MAX = 2.0
 
@@ -235,6 +220,7 @@ class GaussianActor(nn.Module):
 
 
 class SACCritic(nn.Module):
+    """Double-Q critic."""
     def __init__(self, state_dim: int, act_dim: int, hidden_dim: int, n_hidden: int):
         super().__init__()
         self.q1 = _mlp(state_dim + act_dim, 1, hidden_dim, n_hidden)
@@ -251,11 +237,7 @@ class SACCritic(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MOPOAgent:
-    """
-    MOPO offline RL agent.
-    Fits a NLL ensemble on the dataset, generates penalized synthetic rollouts,
-    then trains SAC on those rollouts.
-    """
+    """MOPO agent: fits an NLL ensemble, then trains SAC on penalized model rollouts."""
 
     def __init__(
         self,
@@ -268,7 +250,7 @@ class MOPOAgent:
         self.cfg     = cfg if cfg is not None else MOPOConfig()
         self.device  = torch.device(self.cfg.device)
         self.rng     = np.random.default_rng(self.cfg.seed)
-        self._obs_dim_raw = int(obs_dim)   # raw obs (no goal), for NLL ensemble
+        self._obs_dim_raw = int(obs_dim)   # observation width without goal (ensemble input)
 
         self.ensemble = NLLEnsemble(obs_dim, act_dim, self.cfg)
 
@@ -288,6 +270,7 @@ class MOPOAgent:
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _obs_to_state(self, obs: Any) -> np.ndarray:
+        """Flatten an observation; dicts become concat(observation, desired_goal)."""
         if isinstance(obs, dict):
             o = np.asarray(obs["observation"], dtype=np.float32).reshape(-1)
             g = np.asarray(obs.get("desired_goal", np.zeros(2)), dtype=np.float32).reshape(-1)
@@ -295,6 +278,7 @@ class MOPOAgent:
         return np.asarray(obs, dtype=np.float32).reshape(-1)
 
     def _soft_update(self) -> None:
+        """Polyak update of the target critic."""
         tau = self.cfg.tau
         for p, pt in zip(self.critic.parameters(), self.critic_tgt.parameters()):
             pt.data.copy_(tau * p.data + (1.0 - tau) * pt.data)
@@ -305,9 +289,8 @@ class MOPOAgent:
             return
         self.obs_dim = state_dim
         self._obs_dim_raw = obs_dim_raw
-        # NLL ensemble operates on raw obs (no goal)
         self.ensemble = NLLEnsemble(obs_dim_raw, self.act_dim, self.cfg)
-        # SAC networks operate on state = obs + goal
+        # SAC networks take obs + goal.
         self.actor      = GaussianActor(state_dim, self.act_dim,
                                         self.cfg.hidden_dim, self.cfg.n_hidden).to(self.device)
         self.critic     = SACCritic(state_dim, self.act_dim,
@@ -319,7 +302,7 @@ class MOPOAgent:
         self.c_opt = optim.Adam(self.critic.parameters(), lr=self.cfg.lr)
 
     def _build_state_arrays(self, dataset: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Build (obs_concat, next_obs_concat, act) with goal concatenated."""
+        """Return (obs + goal, next_obs + next_goal, act); goals default to zeros of width 2."""
         obs_raw  = np.asarray(dataset["obs_observation"],  dtype=np.float32)
         nxt_raw  = np.asarray(dataset["next_observation"], dtype=np.float32)
         goal     = np.asarray(dataset.get("obs_desired_goal",
@@ -333,7 +316,11 @@ class MOPOAgent:
     def _model_rollout(
         self, init_obs: np.ndarray, obs_dim_raw: int, goal_dim: int
     ) -> Dict[str, np.ndarray]:
-        """Generate H-step rollouts with penalized reward."""
+        """Generate rollout_length steps from init_obs (goal included) under the actor.
+
+        Reward is -||mu_bar_xy - goal|| - lam * sigma, with done when the distance
+        is below 0.45; terminated rollouts restart from their initial state.
+        """
         B = init_obs.shape[0]
         H = self.cfg.rollout_length
         all_obs, all_act, all_rew, all_nxt, all_done = [], [], [], [], []
@@ -345,16 +332,13 @@ class MOPOAgent:
                 a_t, _ = self.actor(obs_t, deterministic=False)
             act = a_t.cpu().numpy().clip(-1.0, 1.0)
 
-            # Ensemble prediction + sigma
             obs_raw = obs[:, :obs_dim_raw]
             mu_bar, sigma = self.ensemble.predict(obs_raw, act)
 
-            # Penalized reward: distance + -lambda*sigma
             goal = obs[:, obs_dim_raw:]
             dist = np.linalg.norm(mu_bar[:, :min(2, obs_dim_raw)] - goal[:, :2], axis=-1)
             rew = -dist.astype(np.float32) - float(self.cfg.lam) * sigma.astype(np.float32)
 
-            # Next state
             next_raw = self.ensemble.sample_step(obs_raw, act, self.rng)
             next_obs = np.concatenate([next_raw, goal], axis=-1)
             done = (dist < 0.45).astype(np.float32)
@@ -377,7 +361,7 @@ class MOPOAgent:
 
     # ── training ──────────────────────────────────────────────────────────────
     def train(self, dataset: Dict[str, Any], n_epochs: int = 200) -> None:
-        """Train MOPO on offline dataset."""
+        """Fit the NLL ensemble, then train SAC; each epoch is one rollout batch and one step."""
         obs, nxt, act = self._build_state_arrays(dataset)
         state_dim   = obs.shape[1]
         obs_dim_raw = int(dataset["obs_observation"].shape[1])
@@ -385,7 +369,7 @@ class MOPOAgent:
 
         self._rebuild_for_state_dim(state_dim, obs_dim_raw)
 
-        # Fit ensemble on raw obs (observation space only, not goal-concatenated)
+        # The ensemble is fit on observations without the goal.
         obs_raw = np.asarray(dataset["obs_observation"], dtype=np.float32)
         nxt_raw = np.asarray(dataset["next_observation"], dtype=np.float32)
         print("[MOPO] Fitting NLL ensemble...", flush=True)
@@ -398,7 +382,6 @@ class MOPOAgent:
         def _t(x): return torch.as_tensor(np.asarray(x, dtype=np.float32), device=self.device)
 
         for epoch in range(int(n_epochs)):
-            # Generate synthetic rollouts
             idx0 = rng.choice(N, size=min(self.cfg.rollout_batch, N), replace=False)
             synth = self._model_rollout(obs[idx0], obs_dim_raw, goal_dim)
 
@@ -411,7 +394,7 @@ class MOPOAgent:
             s2 = _t(synth["nxt"][idx])
             d  = _t(synth["done"][idx])
 
-            # Critic update
+            # Critic: soft Bellman target.
             with torch.no_grad():
                 a2, lp2 = self.actor(s2)
                 q1t, q2t = self.critic_tgt(s2, a2)
@@ -423,7 +406,7 @@ class MOPOAgent:
             self.c_opt.zero_grad(); c_loss.backward(); self.c_opt.step()
             self.loss_history["critic"].append(float(c_loss))
 
-            # Actor update
+            # Actor.
             a_t, lp = self.actor(s)
             q1pi, q2pi = self.critic(s, a_t)
             a_loss = (self.cfg.sac_alpha * lp - torch.min(q1pi, q2pi)).mean()
@@ -435,23 +418,25 @@ class MOPOAgent:
     # ── inference ─────────────────────────────────────────────────────────────
     @torch.no_grad()
     def act(self, obs: Any) -> np.ndarray:
+        """Return the deterministic action tanh(mu) in [-1, 1]^act_dim."""
         s = torch.as_tensor(self._obs_to_state(obs), dtype=torch.float32,
                             device=self.device).unsqueeze(0)
         a, _ = self.actor(s, deterministic=True)
         return np.clip(a.squeeze(0).cpu().numpy(), -1.0, 1.0).astype(np.float32)
 
     def __call__(self, obs: Any) -> np.ndarray:
+        """Alias for act()."""
         return self.act(obs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MOPOMSEAgent — MOPO with pre-trained MSE ensemble (no NLL re-training)
+# MOPO on a trained MSE ensemble
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class MOPOMSEConfig:
-    """Config for MOPO-MSE: reuses a pre-trained MSE ensemble, no NLL training."""
-    lam:            float = 1.0       # penalty weight λ for epistemic sigma
+    """Penalized-MDP and SAC hyperparameters for MOPOMSEAgent."""
+    lam:            float = 1.0       # penalty weight on the epistemic sigma
     rollout_length: int   = 5
     rollout_batch:  int   = 1000
 
@@ -460,7 +445,7 @@ class MOPOMSEConfig:
     lr:          float = 3e-4
     batch_size:  int   = 256
     gamma:       float = 0.99
-    tau_soft:    float = 0.005
+    tau_soft:    float = 0.005       # Polyak coefficient for the target critic
     sac_alpha:   float = 0.2
 
     device: str = "cpu"
@@ -468,27 +453,24 @@ class MOPOMSEConfig:
 
 
 class MOPOMSEAgent:
-    """
-    MOPO using the pre-trained MSE ensemble (same as Cal-SPI) for fair comparison.
+    """MOPO on a trained MSE ensemble, with SAC on penalized model rollouts.
 
-    sigma(s,a) = sqrt( mean_d Var_k[ mu_k(s,a,d) ] )  — epistemic std from MSE ensemble.
-    Reward penalization: r_pen = r(s,a) - lam * sigma(s,a)
-
-    Trains SAC on synthetic rollouts with penalized rewards.
+    sigma(s, a) = sqrt(mean_d Var_k[mu_k(s, a)_d]) and r_pen = r(s, a) - lam * sigma(s, a).
     """
 
     def __init__(
         self,
-        ensemble,                        # EnsembleDynamicsSB3 (pre-trained MSE)
-        obs_dim: int,                    # full state dim = obs_dim_raw + goal_dim
+        ensemble,                        # trained EnsembleDynamicsSB3
+        obs_dim: int,                    # obs_dim_raw + goal_dim
         act_dim: int,
         cfg: Optional[MOPOMSEConfig] = None,
         reward_fn=None,
     ):
         """
-        reward_fn: optional callable(obs_flat, act, next_obs_flat) -> (rew, done)
-            both float32 [B] arrays.  If None, uses PointMaze distance heuristic.
-            Pass a domain-specific function for flat (non-goal-conditioned) envs.
+        Args:
+            reward_fn: optional callable(obs_flat, act, next_obs_flat) -> (rew, done),
+                float32 arrays of shape [B]. If None, the PointMaze proxy is used:
+                rew = -||xy' - goal||, done = (distance < 0.45).
         """
         self.ensemble  = ensemble
         self.obs_dim   = int(obs_dim)
@@ -514,6 +496,7 @@ class MOPOMSEAgent:
         self.loss_history: Dict[str, list] = {"critic": [], "actor": []}
 
     def _obs_to_state(self, obs: Any) -> np.ndarray:
+        """Flatten an observation; dicts become concat(observation, desired_goal)."""
         if isinstance(obs, dict):
             o = np.asarray(obs["observation"],  dtype=np.float32).reshape(-1)
             g = np.asarray(obs.get("desired_goal", np.zeros(2)), dtype=np.float32).reshape(-1)
@@ -521,11 +504,9 @@ class MOPOMSEAgent:
         return np.asarray(obs, dtype=np.float32).reshape(-1)
 
     def _sigma_batch(self, obs_flat: np.ndarray, act: np.ndarray) -> np.ndarray:
-        """
-        Epistemic std from MSE ensemble members.
-        obs_flat: [B, obs_dim_raw]  (observation only, no goal)
-        act:      [B, act_dim]
-        Returns:  [B] sigma values = sqrt(mean_d Var_k[mu_k]).
+        """Epistemic std sqrt(mean_d Var_k[mu_k]), shape [B].
+
+        obs_flat is [B, obs_dim_raw] (observation without goal), act is [B, act_dim].
         """
         X  = np.concatenate([obs_flat, act], axis=-1).astype(np.float32)
         Xt = torch.as_tensor(X, dtype=torch.float32)
@@ -542,6 +523,11 @@ class MOPOMSEAgent:
         init_obs_flat: np.ndarray,   # [B, obs_dim_raw]
         desired_goal:  np.ndarray,   # [B, goal_dim]
     ) -> Dict[str, np.ndarray]:
+        """Roll out rollout_length steps with penalized reward under the current actor.
+
+        Terminated rollouts restart from their initial state. Returns a transition
+        dict whose observations include the goal.
+        """
         B   = init_obs_flat.shape[0]
         H   = self.cfg.rollout_length
         dev = self.device
@@ -556,10 +542,9 @@ class MOPOMSEAgent:
                 a_t, _ = self.actor(state_t, deterministic=False)
             act = a_t.cpu().numpy().clip(-1.0, 1.0)
 
-            # Epistemic sigma penalty
             sigma = self._sigma_batch(obs, act)
 
-            # Ensemble step (random member per sample)
+            # One ensemble member drawn independently per sample and step.
             k_idx = self.rng.integers(0, len(self.ensemble.ensemble), size=B)
             X  = np.concatenate([obs, act], axis=-1).astype(np.float32)
             Xt = torch.as_tensor(X, dtype=torch.float32)
@@ -572,7 +557,6 @@ class MOPOMSEAgent:
                     delta = self.ensemble.ensemble[k](Xt[mk]).cpu().numpy()
                     next_obs_flat[mk] = obs[mk] + delta
 
-            # r_pen = r_domain - lam * sigma (domain fn) or -dist - lam*sigma (PointMaze)
             if self.reward_fn is not None:
                 rew, done = self.reward_fn(obs, act, next_obs_flat)
                 rew  = rew.astype(np.float32) - float(self.cfg.lam) * sigma
@@ -601,12 +585,13 @@ class MOPOMSEAgent:
         }
 
     def _soft_update(self) -> None:
+        """Polyak update of the target critic."""
         tau = self.cfg.tau_soft
         for p, pt in zip(self.critic.parameters(), self.critic_tgt.parameters()):
             pt.data.copy_(tau * p.data + (1.0 - tau) * pt.data)
 
     def train(self, dataset: Dict[str, Any], n_epochs: int = 200) -> None:
-        """Train MOPO-MSE on offline dataset (ensemble already pre-trained)."""
+        """Train SAC on fresh model rollouts; each epoch is one rollout batch and one step."""
         def _t(x): return torch.as_tensor(np.asarray(x, dtype=np.float32), device=self.device)
 
         obs_raw = np.asarray(dataset["obs_observation"], dtype=np.float32)
@@ -653,10 +638,12 @@ class MOPOMSEAgent:
 
     @torch.no_grad()
     def act(self, obs: Any) -> np.ndarray:
+        """Return the deterministic action tanh(mu) in [-1, 1]^act_dim."""
         s = torch.as_tensor(self._obs_to_state(obs), dtype=torch.float32,
                             device=self.device).unsqueeze(0)
         a, _ = self.actor(s, deterministic=True)
         return np.clip(a.squeeze(0).cpu().numpy(), -1.0, 1.0).astype(np.float32)
 
     def __call__(self, obs: Any) -> np.ndarray:
+        """Alias for act()."""
         return self.act(obs)

@@ -6,6 +6,11 @@ __pycache__/
 build/
 dist/
 results_*/
-models/
 ep_ckpt/
 cache/
+models/*
+!models/ppo_pointmaze.zip
+!models/ppo_hopper.zip
+!models/ppo_halfcheetah.zip
+!models/ppo_walker2d.zip
+!models/ppo_ant.zip

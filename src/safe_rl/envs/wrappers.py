@@ -1,15 +1,15 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
+"""Observation wrappers for goal-conditioned environments."""
 import gymnasium as gym
 import numpy as np
 
 class FlattenPointMazeObs(gym.ObservationWrapper):
-    """
-    Converts Dict observation from PointMaze into a single flat numpy array:
-    [observation, achieved_goal, desired_goal]
-    """
+    """Flattens the PointMaze dict observation into [observation, achieved_goal, desired_goal]."""
+
     def __init__(self, env):
         super().__init__(env)
         obs_space = env.observation_space
@@ -33,6 +33,7 @@ class FlattenPointMazeObs(gym.ObservationWrapper):
         )
 
     def observation(self, obs):
+        """Return the concatenated float32 observation vector."""
         return np.concatenate([
             obs["observation"],
             obs["achieved_goal"],

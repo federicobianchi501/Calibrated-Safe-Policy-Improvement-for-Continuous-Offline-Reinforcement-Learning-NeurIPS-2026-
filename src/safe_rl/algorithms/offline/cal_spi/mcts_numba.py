@@ -1,30 +1,19 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
 """
-Numba-accelerated drop-in for the parametric MCTS-DPW planner.
+Numba backend for the parametric MCTS-DPW planner.
 
-Subclasses `OfflineMCTS_DPW_PPO_SPIBB_Parametric` and overrides only the
-hot calls:
+Subclasses `OfflineMCTS_DPW_PPO_SPIBB_Parametric` and replaces the PPO actor
+forward, the ensemble forward (USAD / epistemic variance) and the model-env
+transition in `_search` with njit kernels. Tree structure, PUCT selection,
+progressive widening, gate and root selection are inherited; results match
+the torch planner up to float32 rounding of the network forward passes.
 
-  * `_ppo_mean`        -> njit PPO actor forward (extracted SB3 weights)
-  * `_uncertainty_raw` -> njit ensemble forward + USAD (extracted weights)
-  * `_search`          -> same algorithmic logic as the parent, but replaces
-                          `model_env.step` with an inlined njit transition:
-                          ensemble forward -> delta[mi] -> flat locomotion
-                          reward and health-based termination.
-
-The tree structure, PUCT selection, progressive widening, gating logic,
-and root selection are inherited verbatim from the parametric class. This
-is deliberate: we need byte-level algorithmic parity, and the only thing
-that should differ is the numerical evaluation of the ensemble and of
-the policy network (which differ from the torch equivalents within
-float32 rounding, ~1e-5).
-
-The numba planner is NOT a replacement for training or serialization.
-It reads weights from a fitted EnsembleDynamicsSB3 and a loaded SB3 PPO
-once at construction time, then runs read-only forward passes.
+Weights are read once at construction from a fitted EnsembleDynamicsSB3 and
+an SB3 PPO policy; the planner only runs forward passes.
 """
 
 from __future__ import annotations
@@ -53,11 +42,11 @@ from safe_rl.offline.ensemble_numba import (
 
 class OfflineMCTS_DPW_PPO_Numba(OfflineMCTS_DPW_PPO_SPIBB_Parametric):
     """
-    Numba-backed drop-in replacement for the parametric planner.
+    Parametric planner with numba forward passes and inlined model steps.
 
-    Same `act(obs)` signature and same config semantics. Works with the
-    continuous locomotion ModelContinuousEnv (flat obs, reward and
-    termination reconstructed from health/velocity indices).
+    Same `act(obs)` interface and config as the parent. Requires a
+    ModelContinuousEnv (flat obs); reward and termination are recomputed from
+    the velocity, height and angle indices in its config.
     """
 
     def __init__(
@@ -116,9 +105,8 @@ class OfflineMCTS_DPW_PPO_Numba(OfflineMCTS_DPW_PPO_SPIBB_Parametric):
         self._h2_p = np.zeros((H2_p,), dtype=np.float32)
         self._out_p = np.zeros((self._ppo_w.act_dim,), dtype=np.float32)
 
-        # ModelContinuousEnv reward/termination parameters cached locally so
-        # `_search` can inline the transition without a Python attribute walk
-        # on every step.
+        # Reward/termination parameters of ModelContinuousEnv, cached for the
+        # inlined transition.
         mc = getattr(model_env, "cfg", None)
         if mc is None:
             raise ValueError("model_env has no .cfg; expected ModelContinuousEnvConfig")
@@ -146,7 +134,6 @@ class OfflineMCTS_DPW_PPO_Numba(OfflineMCTS_DPW_PPO_SPIBB_Parametric):
             self._ppo_w.W3, self._ppo_w.b3,
             self._out_p, self._h1_p, self._h2_p,
         )
-        # Return a fresh copy so callers can cache it safely.
         return self._out_p.copy()
 
     # ---------------------------------------------------------- Uncertainty
@@ -187,13 +174,10 @@ class OfflineMCTS_DPW_PPO_Numba(OfflineMCTS_DPW_PPO_SPIBB_Parametric):
                 self._ens_w.input_mean, self._ens_w.input_inv_std, self._ens_w.has_norm,
                 self._deltas, self._h1_e, self._h2_e, self._x_e,
             )
-        return self._deltas  # internal buffer — do not mutate externally
+        return self._deltas  # internal buffer, overwritten by the next call
 
     def _is_safe_from_u(self, u: float) -> bool:
-        """
-        Replicates `_is_safe` gate logic given a precomputed USAD value.
-        Used inside the search loop when we have already computed deltas.
-        """
+        """Gate decision of `_is_safe` for a precomputed uncertainty value."""
         if not self.use_gate:
             return True
         if str(self.cfg.gate_mode) == "uncertainty":
@@ -225,9 +209,9 @@ class OfflineMCTS_DPW_PPO_Numba(OfflineMCTS_DPW_PPO_SPIBB_Parametric):
         self, obs: np.ndarray, action: np.ndarray, mi: int,
     ) -> Tuple[np.ndarray, float, bool, bool]:
         """
-        Same as `_step_fast` but uses the deltas already in `self._deltas`
-        from a previous `_compute_deltas` call. Caller must guarantee that
-        the buffer still corresponds to the intended (obs, action) pair.
+        `_step_fast` using the deltas already in `self._deltas`.
+
+        The buffer must hold the deltas of the same (obs, action) pair.
         """
         obs_np = np.asarray(obs, dtype=np.float32).reshape(-1)
         act_np = np.asarray(action, dtype=np.float32).reshape(-1)
@@ -238,11 +222,8 @@ class OfflineMCTS_DPW_PPO_Numba(OfflineMCTS_DPW_PPO_SPIBB_Parametric):
         self, obs: np.ndarray, action: np.ndarray, mi: int,
     ) -> Tuple[np.ndarray, float, bool, bool]:
         """
-        Inlined model-env step: ensemble forward -> delta[mi] -> next obs,
-        locomotion reward, health-based termination.
-
-        Matches ModelContinuousEnv.step up to the float32 rounding difference
-        between the torch and numba forward passes.
+        Model step with member `mi`: next obs, locomotion reward, health-based
+        termination. Matches ModelContinuousEnv.step up to float32 rounding.
         """
         deltas = self._compute_deltas(obs, action)
         obs_np = np.asarray(obs, dtype=np.float32).reshape(-1)
@@ -299,9 +280,8 @@ class OfflineMCTS_DPW_PPO_Numba(OfflineMCTS_DPW_PPO_SPIBB_Parametric):
         a = self._clip_action(node.actions[a_idx])
         node.actions[a_idx] = a
 
-        # Compute ensemble deltas once, then reuse for both the gate check
-        # (USAD) and the transition. Bit-exact because deltas are a pure
-        # function of (obs, action, weights) and the rng is not touched here.
+        # Deltas are computed once and reused for the gate (USAD) and the
+        # transition; no RNG draw happens in between.
         self._compute_deltas(node.obs, a)
         u = self._usad_from_cached_deltas()
         safe = self._is_safe_from_u(u)
@@ -348,14 +328,12 @@ from safe_rl.algorithms.offline.cal_spi.mcts_cspi import _CSPIMixin  # noqa: E40
 
 class OfflineMCTS_DPW_PPO_Numba_CSPI(_CSPIMixin, OfflineMCTS_DPW_PPO_Numba):
     """
-    Conservative Safe Policy Improvement on top of the numba-backed planner.
+    Conservative SPI planner on the numba backend.
 
-    Mirrors `OfflineMCTS_DPW_PPO_SPIBB_CSPI_Parametric` verbatim for the
-    root-selection logic (baseline gate, V_hat_b rollout, margin test) and
-    inherits the numba-accelerated `_search` from the numba base. The
-    rollout for V_hat_b still goes through the torch-backed model_env and
-    ppo.predict, but that is only `cspi_v_rollout_horizon` steps per
-    `act()` call and is negligible compared to the MCTS simulations.
+    Root selection (baseline gate, frozen root, forced minimum root visits,
+    margin test against the baseline action) follows
+    `OfflineMCTS_DPW_PPO_SPIBB_CSPI_Parametric`; tree search uses the numba
+    transition.
     """
 
     def __init__(
@@ -383,14 +361,13 @@ class OfflineMCTS_DPW_PPO_Numba_CSPI(_CSPIMixin, OfflineMCTS_DPW_PPO_Numba):
         self._cspi_root_safe_ids: Optional[list] = None
         self.cspi_reset_stats()
 
-    # ------------------------------------------------------------------
-    # Numba V_b rollout: averages `_cspi_v_rollout_n_samples` independent
-    # rollouts of length `_cspi_v_rollout_horizon` using the njit PPO
-    # actor and inlined ensemble step, then returns the mean return.
-    # Cost per rollout step ~0.6 ms (vs ~7 ms torch), so even averaging
-    # 5 rollouts at horizon 100 stays under 1 % of a paper-grade act().
-    # ------------------------------------------------------------------
     def _cspi_v_b_rollout(self, obs_root: Any) -> float:
+        """
+        Mean discounted return of `_cspi_v_rollout_n_samples` baseline rollouts
+        of length `_cspi_v_rollout_horizon` in the model, each step with a
+        uniformly drawn member. A rollout stops at a gate rejection (when
+        `gate_inside_tree`) or at termination.
+        """
         n_samples = int(max(1, self._cspi_v_rollout_n_samples))
         gamma = float(self.cfg.gamma)
         horizon = int(self._cspi_v_rollout_horizon)
@@ -418,6 +395,13 @@ class OfflineMCTS_DPW_PPO_Numba_CSPI(_CSPIMixin, OfflineMCTS_DPW_PPO_Numba):
         return float(acc / float(n_samples))
 
     def act(self, obs: Dict[str, np.ndarray]) -> np.ndarray:
+        """
+        Return the planned action, or the baseline action on fallback.
+
+        Falls back to the PPO action in the low-data regime, when the baseline
+        action is gated out, when no root action is safe, or when the best
+        safe root Q does not exceed Q(a_b) by the operational margin.
+        """
         self._cspi_stats_n_calls += 1
 
         if (
@@ -496,9 +480,8 @@ class OfflineMCTS_DPW_PPO_Numba_CSPI(_CSPIMixin, OfflineMCTS_DPW_PPO_Numba):
         best_i = max(cands, key=lambda j: root.Nsa[j])
         a_star = np.asarray(root.actions[best_i], dtype=np.float32)
 
-        # Root-symmetric switch rule: compare Q_hat(a*) with Q_hat(a_b)
-        # from the same MCTS tree, same gate, same scale. a_b is
-        # root.actions[0] by construction.
+        # Switch rule: Q_hat(a*) vs Q_hat(a_b) from the same tree; a_b is
+        # root.actions[0].
         q_b = float(root.Q[0])
         eta_op = float(self._cspi_margin_mult) * float(self._cspi_e_plan_scale)
         margin_observed = float(q_best) - float(q_b)
@@ -515,7 +498,7 @@ class OfflineMCTS_DPW_PPO_Numba_CSPI(_CSPIMixin, OfflineMCTS_DPW_PPO_Numba):
         self._cspi_stats_n_fallback_margin += 1
         return a_b
 
-    # ---- Overridden _search for frozen root + forced min visits ----
+    # ---- _search with frozen root and forced minimum root visits ----
     def _search(self, node: Node, mi: Optional[int]) -> float:
         node.N += 1
 
@@ -561,7 +544,7 @@ class OfflineMCTS_DPW_PPO_Numba_CSPI(_CSPIMixin, OfflineMCTS_DPW_PPO_Numba):
         a = self._clip_action(node.actions[a_idx])
         node.actions[a_idx] = a
 
-        # Cached-deltas pipeline: compute once, reuse for USAD + transition.
+        # Deltas reused for USAD and the transition.
         self._compute_deltas(node.obs, a)
         u = self._usad_from_cached_deltas()
         safe = self._is_safe_from_u(u)

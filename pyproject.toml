@@ -4,9 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "calibrated-safe-policy-improvement"
-version = "1.0.0"
-description = "Reference implementation of Cal-SPI for the NeurIPS 2026 submission."
+version = "1.1.0"
+description = "Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning (NeurIPS 2026)."
+authors = [
+    { name = "Federico Bianchi" },
+    { name = "Alessandro Farinelli" },
+    { name = "Alberto Castellini" },
+]
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.8"
 dependencies = [
     "gymnasium==1.0.0",

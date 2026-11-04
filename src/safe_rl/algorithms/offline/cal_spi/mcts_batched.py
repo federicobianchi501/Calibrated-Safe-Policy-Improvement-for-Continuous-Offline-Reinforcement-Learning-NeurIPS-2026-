@@ -1,58 +1,32 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
 """
-offline_mcts_batched.py — Batched-eval variant of OfflineMCTS_DPW_PPO_SPIBB_Parametric.
+Batched-evaluation variant of the reference MCTS-DPW planner.
 
-Public contract is identical to the original planner:
-    class OfflineMCTS_DPW_PPO_Batched
-        __init__(model_env, ppo_policy, cfg, calibrator=None, use_gate=True,
-                 use_ppo_prior=True, use_ppo_leaf_value=True, rng_seed=0)
-        .act(obs) -> np.ndarray
-        .last_root_fallback: bool
-        .last_root_coverage: float
+``OfflineMCTS_DPW_PPO_Batched`` has the same constructor, ``act`` method and logging
+attributes as ``OfflineMCTS_DPW_PPO_SPIBB_Parametric``. Instead of querying the
+ensemble once per (s, a) visit, it runs one batched forward pass when actions are
+added to a node and caches, per action a_k:
+    u_cache[k]              uncertainty score u(s, a_k)
+    safe_cache[k]           gate decision for (s, a_k)
+    next_obs_cache[k][mi]   next observation predicted by member mi
+    reward_cache[k][mi]     reward of that transition
+    terminated_cache[k][mi] termination flag (unhealthy state or non-finite prediction)
+Later visits to (s, a_k) read from the cache without calling the ensemble.
 
-Algorithmic difference vs the original:
-    The original calls ensemble.uncertainty(obs, a) and ensemble.predict(obs, a)
-    on a SINGLE (obs, a) pair every time _search visits a node. That issues two
-    torch dispatches per visit, dominated by per-call overhead (~80 us / call,
-    ~95% of the total time of the planner).
-
-    The batched variant evaluates the ensemble ONCE per node, when actions are
-    expanded: for K newly added actions at node n with obs s, it calls
-    ensemble.forward([s repeated K times, [a_1, ..., a_K]]) in a single batch
-    and stores on the node:
-        u_cache[k]            = uncertainty score for (s, a_k)
-        safe_cache[k]         = gate decision for (s, a_k)
-        next_obs_cache[k, mi] = predicted next obs from member mi at (s, a_k)
-        reward_cache[k, mi]   = locomotion reward for next_obs_cache[k, mi]
-        terminated_cache[k, mi] = healthy/nan termination flag
-
-    Subsequent simulations that traverse (n, a_k) reuse the cache without
-    issuing any torch call. With num_sims=200 and ~20 root actions, this
-    amortizes the ensemble cost by ~10x at the root.
-
-Numerical parity with the original planner:
-    The batched variant produces BYTE-IDENTICAL action sequences to the
-    original under the following preconditions:
-      * cfg.model_sampling == "fixed_per_sim"  (the only mode we support)
-      * Same rng_seed
-      * Same cfg, ensemble, calibrator, ppo policy
-      * Same input observation
-      * MLP layers are stateless (no BatchNorm/Dropout) — verified for MLP512
-    Justification of byte-equality:
-      1. RNG consumption order matches the original exactly:
-            (a) self.rng.integers(0, E, num_sims) at start of act()
-            (b) self.rng.standard_normal in _sample_ppo, called from
-                _expand_action in the same order
-      2. Model predictions are bit-identical because m(batch)[k] equals
-         m(single_k) for stateless MLP layers.
-      3. PUCT selection uses the same statistics in the same order.
-      4. Tie-breaking in root selection uses the same tol and same key.
-      5. With explicit integer model_index, sample_next_obs_vec never reads
-         self.rng — so caching does not skip any rng call.
-
+Equivalence with the reference planner: for ``model_sampling="fixed_per_sim"`` (the
+only supported mode) and the same seed, config, ensemble, calibrator, PPO policy and
+observation, both planners return identical actions, because
+  1. the RNG is consumed in the same order: ``rng.integers(0, E, num_sims)`` at the
+     start of ``act``, then ``rng.standard_normal`` in ``_sample_ppo`` per expansion;
+  2. member outputs on a batch equal per-sample outputs for stateless MLPs
+     (no BatchNorm or Dropout);
+  3. PUCT selection and root tie-breaking use the same statistics, tolerance and key;
+  4. with an explicit model index the model step draws no random numbers, so caching
+     skips no RNG call.
 """
 
 from __future__ import annotations
@@ -86,7 +60,7 @@ class _BatchedNode:
         self.P: List[float] = []
         self.Q: List[float] = []
         self.Nsa: List[int] = []
-        # Per-action caches, indexed by action position in self.actions
+        # Per-action caches, aligned with self.actions.
         self.u_cache: List[float] = []
         self.safe_cache: List[bool] = []
         self.next_obs_cache: List[np.ndarray] = []   # each entry: [E, obs_dim]
@@ -95,9 +69,10 @@ class _BatchedNode:
 
 
 class OfflineMCTS_DPW_PPO_Batched:
-    """Drop-in replacement for OfflineMCTS_DPW_PPO_SPIBB_Parametric with batched eval.
+    """Batched-evaluation planner with the interface of the reference planner.
 
-    See module docstring for the parity argument and the supported configurations.
+    Supports only ``model_sampling="fixed_per_sim"``; see the module docstring for the
+    equivalence conditions.
     """
 
     def __init__(
@@ -134,8 +109,7 @@ class OfflineMCTS_DPW_PPO_Batched:
         self.last_root_coverage: float = 0.0
         self._debug_once: bool = False
 
-        # Resolve the underlying ensemble (model_env.ens is EnsembleFlatWrapper;
-        # the raw EnsembleDynamicsSB3 lives at model_env.ens._ens).
+        # model_env.ens may be a flat-obs wrapper; the raw ensemble is then at .ens._ens.
         wrapper = self.model_env.ens
         self._ens = getattr(wrapper, "_ens", wrapper)
         self._E = int(getattr(self._ens.cfg, "ensemble_size", 4))
@@ -144,13 +118,15 @@ class OfflineMCTS_DPW_PPO_Batched:
         self._device = self._ens.device
 
     # ------------------------------------------------------------------
-    # PPO helpers (mirror of the original; identical RNG consumption)
+    # PPO helpers (same RNG consumption as the reference planner)
     # ------------------------------------------------------------------
     def _ppo_mean(self, obs: Any) -> np.ndarray:
+        """Deterministic PPO action a_b(s) as a flat float32 vector."""
         a, _ = self.ppo.predict(obs, deterministic=True)
         return np.asarray(a, dtype=np.float32).reshape(-1)
 
     def _sample_ppo(self, obs: Any, n: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Sample n clipped actions from N(a_b(s), sigma^2 I); returns ``(actions, priors)``."""
         mean = self._clip_action(self._ppo_mean(obs))
         act_dim = int(mean.shape[0])
         std = float(self.cfg.ppo_std_scale)
@@ -162,10 +138,12 @@ class OfflineMCTS_DPW_PPO_Batched:
         return acts, priors
 
     def _clip_action(self, action: np.ndarray) -> np.ndarray:
+        """Clip an action to [-1, 1]."""
         a = np.asarray(action, dtype=np.float32).reshape(-1)
         return np.clip(a, -1.0, 1.0).astype(np.float32)
 
     def _leaf_value(self, obs: Any) -> float:
+        """PPO value estimate, or 0 when PPO leaf values are disabled or unavailable."""
         if (not self.use_ppo_leaf_value) or (str(self.cfg.leaf_value_mode) == "zero"):
             return 0.0
         try:
@@ -185,14 +163,14 @@ class OfflineMCTS_DPW_PPO_Batched:
         obs: Any,
         actions: np.ndarray,
     ) -> np.ndarray:
-        """Compute ensemble delta predictions for K actions at a single obs.
+        """Ensemble delta predictions for K actions at one observation.
 
         Args:
-            obs:     flat observation (or dict with 'observation' key)
-            actions: [K, act_dim]
+            obs: flat observation, or dict with an ``"observation"`` key.
+            actions: array of shape [K, act_dim].
 
         Returns:
-            mus: [E, K, obs_dim]  — one delta prediction per member, per action
+            Array of shape [E, K, obs_dim]: delta prediction per member and action.
         """
         if isinstance(obs, dict):
             obs_arr = np.asarray(obs["observation"], dtype=np.float32).reshape(-1)
@@ -214,10 +192,7 @@ class OfflineMCTS_DPW_PPO_Batched:
 
     @staticmethod
     def _uncertainty_usad_batch(mus: np.ndarray) -> np.ndarray:
-        """Pairwise max L2 across ensemble members, vectorized over K samples.
-
-        mus: [E, K, obs_dim]  →  out: [K]
-        """
+        """USAD score: max pairwise L2 distance between members. [E, K, d] -> [K]."""
         E = mus.shape[0]
         K = mus.shape[1]
         out = np.zeros(K, dtype=np.float32)
@@ -229,21 +204,19 @@ class OfflineMCTS_DPW_PPO_Batched:
 
     @staticmethod
     def _uncertainty_epistemic_batch(mus: np.ndarray) -> np.ndarray:
-        """Mean-variance across ensemble members, per sample.
-
-        mus: [E, K, obs_dim]  →  out: [K]
-        """
+        """Epistemic score: per-dimension variance across members, averaged over
+        dimensions. [E, K, d] -> [K]."""
         return mus.var(axis=0).mean(axis=-1).astype(np.float32)
 
     # ------------------------------------------------------------------
-    # Gate decision (vectorized via cached u; identical to original logic)
+    # Gate decision (same logic as the reference planner)
     # ------------------------------------------------------------------
     def _safe_from_u(self, u: float) -> bool:
+        """Gate decision from a precomputed score u; unsafe in the low-data regime."""
         if not self.use_gate:
             return True
         if str(self.cfg.gate_mode) == "uncertainty":
             return bool(u <= float(self.cfg.uncertainty_threshold))
-        # calibrated
         if self.calibrator is None:
             raise ValueError("gate_mode='calibrated' requires calibrator")
         if (
@@ -263,9 +236,7 @@ class OfflineMCTS_DPW_PPO_Batched:
     # Cache population
     # ------------------------------------------------------------------
     def _populate_cache(self, node: _BatchedNode, new_actions: List[np.ndarray]) -> None:
-        """For K newly added actions, run a single batched ensemble forward
-        and fill the node's per-action caches.
-        """
+        """Run one batched ensemble forward for the new actions and fill the node caches."""
         K = len(new_actions)
         if K == 0:
             return
@@ -273,15 +244,13 @@ class OfflineMCTS_DPW_PPO_Batched:
         acts_arr = np.stack(new_actions, axis=0).astype(np.float32)
         mus = self._batched_predict_all(node.obs, acts_arr)  # [E, K, obs_dim]
 
-        # Uncertainty per action
         ut = str(self.cfg.uncertainty_type)
         if ut == "usad":
             u_arr = self._uncertainty_usad_batch(mus)
         else:
-            # both "epistemic" and "total" use mean-variance
+            # "epistemic" and "total" both use the member variance of the means.
             u_arr = self._uncertainty_epistemic_batch(mus)
 
-        # Pre-extract obs as a flat numpy array for next-obs computation
         if isinstance(node.obs, dict):
             obs_flat = np.asarray(node.obs["observation"], dtype=np.float32).reshape(-1)
         else:
@@ -295,13 +264,13 @@ class OfflineMCTS_DPW_PPO_Batched:
             u = float(u_arr[k])
             safe = self._safe_from_u(u)
 
-            # next_obs per ensemble member: [E, obs_dim]
+            # Next observation per member, [E, obs_dim].
             next_obs_per_mi = obs_flat[None, :] + mus[:, k, :]
             next_obs_per_mi = next_obs_per_mi.astype(np.float32)
             if obs_clip > 0:
                 next_obs_per_mi = np.clip(next_obs_per_mi, -obs_clip, obs_clip)
 
-            # action clipped exactly as the original model_env.step does
+            # Same clipping as model_env.step.
             a_clipped = np.clip(new_actions[k], -1.0, 1.0).astype(np.float32)
 
             r_per_mi = np.zeros(self._E, dtype=np.float32)
@@ -326,6 +295,7 @@ class OfflineMCTS_DPW_PPO_Batched:
     # MCTS internals
     # ------------------------------------------------------------------
     def _expand_action(self, node: _BatchedNode, n_actions: int) -> None:
+        """Append ``n_actions`` PPO-sampled actions to ``node`` and cache their evaluations."""
         acts, priors = self._sample_ppo(node.obs, n_actions)
         new_actions: List[np.ndarray] = []
         for a, p in zip(acts, priors):
@@ -339,6 +309,7 @@ class OfflineMCTS_DPW_PPO_Batched:
         self._populate_cache(node, new_actions)
 
     def _select_child(self, node: _BatchedNode) -> int:
+        """PUCT selection: argmax_i Q[i] + c_puct * P[i] * sqrt(N) / max(1, Nsa[i])."""
         N = float(max(1, node.N))
         best_i = -1
         best_score = -1e30
@@ -352,6 +323,7 @@ class OfflineMCTS_DPW_PPO_Batched:
         return int(best_i)
 
     def _search(self, node: _BatchedNode, mi: int) -> float:
+        """Run one simulation below ``node`` with ensemble member ``mi``; value 0 at max depth."""
         node.N += 1
 
         if node.depth >= int(self.cfg.max_depth):
@@ -373,7 +345,6 @@ class OfflineMCTS_DPW_PPO_Batched:
         if a_idx < 0:
             return self._leaf_value(node.obs)
 
-        # Cached safety check
         safe = node.safe_cache[a_idx] if self.use_gate else True
         if self.use_gate and bool(self.cfg.gate_inside_tree) and (not safe):
             v = self._leaf_value(node.obs)
@@ -383,11 +354,11 @@ class OfflineMCTS_DPW_PPO_Batched:
                 node.P[a_idx] = 0.0
             return float(v)
 
-        # Cached model step (no torch call)
+        # Model step from the cache.
         obs_next = node.next_obs_cache[a_idx][mi]
         r = float(node.reward_cache[a_idx][mi])
         terminated = bool(node.terminated_cache[a_idx][mi])
-        truncated = False  # MCTS uses truncate_on_time_limit=False
+        truncated = False  # no time-limit truncation inside the tree
 
         child = node.children[a_idx]
         if child is None:
@@ -407,7 +378,8 @@ class OfflineMCTS_DPW_PPO_Batched:
     # Public API
     # ------------------------------------------------------------------
     def act(self, obs: Any) -> np.ndarray:
-        # Hard conservative mode (identical to original)
+        """Plan from ``obs`` and return the selected action (PPO mean on fallback)."""
+        # Low-data regime: return the baseline without searching.
         if (
             bool(self.cfg.conservative_on_low_data)
             and self.calibrator is not None
@@ -419,7 +391,7 @@ class OfflineMCTS_DPW_PPO_Batched:
 
         root = _BatchedNode(obs=obs, depth=0)
 
-        # Seed root with the PPO mean (identical to original)
+        # The PPO mean is the first root candidate.
         try:
             a_ppo = self._clip_action(self._ppo_mean(obs))
             root.actions.append(a_ppo)
@@ -431,14 +403,14 @@ class OfflineMCTS_DPW_PPO_Batched:
         except Exception:
             pass
 
-        # Sample model indices once (matches original RNG consumption)
+        # One ensemble member per simulation, drawn before any action sampling.
         model_indices = self.rng.integers(0, self._E, size=int(self.cfg.num_sims))
 
         for s in range(int(self.cfg.num_sims)):
             mi = int(model_indices[s])
             self._search(root, mi=mi)
 
-        # Root selection — identical logic, using cached safe flags
+        # Root selection over safe actions (cached flags); PPO mean if none is safe.
         if self.use_gate:
             safe_ids = [i for i in range(len(root.actions)) if root.safe_cache[i]]
         else:

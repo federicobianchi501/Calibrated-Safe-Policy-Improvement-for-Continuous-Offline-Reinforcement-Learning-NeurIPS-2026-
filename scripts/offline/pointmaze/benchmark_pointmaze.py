@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-"""
-Point Maze benchmark driver.
+"""PointMaze_UMazeDense-v3 benchmark driver: Cal-SPI, gate variants and offline RL baselines.
 
 Pipeline per (seed, dataset size):
   - Train one global PPO behavior policy (single checkpoint, reused across cells).
@@ -15,16 +15,15 @@ Pipeline per (seed, dataset size):
   - Split each dataset into train / calibration by trajectory, with the
     calibration ids fixed once per seed (computed on max_ds) and intersected
     with the current ds.
-  - Train one ensemble and one calibrator per ds; plan with one MCTS-DPW
-    instance per method.
+  - Train one ensemble and fit the USAD and variance calibrators per ds; plan
+    with one MCTS-DPW instance per method (--mcts_backend parametric or array).
   - Evaluate each planner on the true environment with a seed that does not
     depend on ds.
   - The model env used inside MCTS sets truncate_on_time_limit=False so the
     effective planning horizon is exactly max_depth.
 
-The "mcts_unsafe_model_only" method runs MCTS-DPW on the learned model with
-no calibrated gate, no PPO prior, no PPO value, and no fallback; it isolates
-unconstrained model exploitation.
+The "mcts_only_no_gate" method runs MCTS-DPW on the learned model with
+no calibrated gate, no PPO prior, no PPO value and no fallback.
 """
 
 from __future__ import annotations
@@ -81,12 +80,11 @@ except ImportError:
 # -------------------------
 
 def rollout_trajectory(env, act_fn, *, seed: int, max_steps: int):
-    """
-    Run one episode and store full 2D trajectory:
-      - achieved_goal positions
-      - desired_goal
-      - start position
-      - success / termination info
+    """Run one episode and record the 2D trajectory of achieved_goal.
+
+    Returns:
+        Dict with "xy" [T+1, 2] (initial point included), "start", "goal",
+        per-step "rewards" and "done_flags", "n_steps", "success", "terminated".
     """
     obs, info = env.reset(seed=int(seed))
 
@@ -98,7 +96,6 @@ def rollout_trajectory(env, act_fn, *, seed: int, max_steps: int):
     start_ag = np.asarray(obs["achieved_goal"], dtype=np.float32).copy()
     goal = np.asarray(obs["desired_goal"], dtype=np.float32).copy()
 
-    # include initial point
     pts.append(start_ag.copy())
 
     for t in range(int(max_steps)):
@@ -129,6 +126,7 @@ def rollout_trajectory(env, act_fn, *, seed: int, max_steps: int):
 
 
 def save_traj_npz(path: str, traj: Dict[str, Any]) -> None:
+    """Save a trajectory dict from rollout_trajectory as a compressed NPZ."""
     ensure_dir(os.path.dirname(path))
 
     payload = {
@@ -139,7 +137,7 @@ def save_traj_npz(path: str, traj: Dict[str, Any]) -> None:
         "success": np.asarray([float(traj.get("success", 0.0))], dtype=np.float32),
     }
 
-    # Optional fields: save only if present
+    # Optional fields.
     if "rewards" in traj:
         payload["rewards"] = np.asarray(traj["rewards"], dtype=np.float32)
     if "done_flags" in traj:
@@ -162,12 +160,7 @@ def save_traj_npz(path: str, traj: Dict[str, Any]) -> None:
 
 
 def plot_trajectories_2d(trajs_by_method: Dict[str, List[Dict[str, Any]]], outpath: str, title: str = ""):
-    """
-    One 2D plot:
-      - target as star
-      - start as black circle
-      - one or more trajectories per method
-    """
+    """Plot the trajectories of each method on one 2D figure (start, target, final points)."""
     ensure_dir(os.path.dirname(outpath))
 
     style = {
@@ -203,7 +196,7 @@ def plot_trajectories_2d(trajs_by_method: Dict[str, List[Dict[str, Any]]], outpa
                 label=st["label"] if k == 0 else None,
             )
 
-            # mark final point
+            # Final point.
             ax.scatter(
                 xy[-1, 0],
                 xy[-1, 1],
@@ -247,10 +240,12 @@ def plot_trajectories_2d(trajs_by_method: Dict[str, List[Dict[str, Any]]], outpa
 
 
 def ensure_dir(p: str) -> None:
+    """Create directory p (and parents) if missing."""
     os.makedirs(p, exist_ok=True)
 
 def _jsonable(x):
-    # Convert numpy / torch / dataclass to json-friendly
+    # numpy scalars, dataclasses and sets/tuples to JSON-serializable values;
+    # arrays are replaced by a shape/dtype stub.
     if is_dataclass(x):
         return asdict(x)
     if isinstance(x, (np.integer, np.floating)):
@@ -262,6 +257,7 @@ def _jsonable(x):
     return x
 
 def sha256_file(path: str) -> str:
+    """Return the hex SHA-256 digest of a file."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
@@ -293,6 +289,7 @@ def _dbg_shape(name_a: str, a: np.ndarray, name_b: str, b: np.ndarray) -> None:
         print(f"[CALIB DBG] SHAPE MISMATCH: {name_a}.shape={a.shape} vs {name_b}.shape={b.shape}", flush=True)
 
 def make_env(continuing_task: int, reward_type: str, seed: int, living_cost: float = 0.0, success_bonus: float = 0.0, reward_mode: str = "current", step_penalty: float = 1.0, dist_penalty: float = 0.2):
+    """Build the PointMaze env with the given task and reward configuration."""
     return make_pointmaze_env(
         int(seed),
         continuing_task=bool(int(continuing_task)),
@@ -318,6 +315,7 @@ def run_ppo_training_to_path(
     success_bonus: float,
     living_cost: float,
 ) -> str:
+    """Train PPO in a subprocess via train_ppo_script and return the checkpoint path."""
     ensure_dir(os.path.dirname(out_path) or ".")
     cmd = [
         sys.executable,
@@ -346,7 +344,8 @@ def run_ppo_training_to_path(
 import numpy as np
 
 def cvar_lower_tail(x: np.ndarray, alpha: float = 0.15) -> float:
-    x = np.asarray(x, dtype=np.float64)
+    """Mean of the values at or below the alpha-quantile (lower-tail CVaR)."""
+    x =np.asarray(x, dtype=np.float64)
     if x.size == 0:
         return 0.0
     q = float(np.quantile(x, alpha))
@@ -358,9 +357,9 @@ def _discounted_add(ret_d: float, r: float, gamma: float, t: int) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Episode-level checkpoint utilities (power-outage safe resume)
+# Episode-level checkpoints (resumable runs)
 # ---------------------------------------------------------------------------
-# Files written per outdir (e.g. results_pointmaze/dsN/seedK/):
+# Files written per output directory:
 #   ep_ckpt/<method>.jsonl   — one JSON line per completed episode (append-only)
 #   results_partial.jsonl    — one JSON line per completed method (append-only)
 #   models/<method>.pt       — trained baseline model weights
@@ -400,9 +399,11 @@ class _PMEpisodeCheckpoint:
                         pass  # ignore truncated last line
 
     def n_done(self) -> int:
+        """Number of episodes already recorded."""
         return len(self.episodes)
 
     def append(self, ep_data: Dict) -> None:
+        """Record one episode in memory and append it to the JSONL file."""
         import time as _time
         self.episodes.append(ep_data)
         with open(self.path, "a") as f:
@@ -540,6 +541,15 @@ def _eval_policy_episodic(
     capture_episode_indices: Optional[Set[int]] = None,
     ckpt: Optional["_PMEpisodeCheckpoint"] = None,
 ):
+    """Evaluate act_fn for n_episodes on env; episode i is reset with seed + i.
+
+    With ckpt, episodes already on disk are skipped and the metrics are aggregated
+    over all recorded episodes. act_fn may expose last_root_fallback and
+    last_root_coverage, which are averaged per episode.
+
+    Returns:
+        (summary, arrays {"R", "RD", "R0"}, {episode_index: trajectory payload}).
+    """
     n_already = ckpt.n_done() if ckpt is not None else 0
     n_todo    = max(0, int(n_episodes) - n_already)
 
@@ -585,7 +595,7 @@ def _eval_policy_episodic(
         for t in range(int(max_steps)):
             a = act_fn(obs)
 
-            # diagnostics hooks
+            # Planner diagnostics exposed as attributes of act_fn.
             fb_count += int(bool(getattr(act_fn, "last_root_fallback", False)))
             cov_sum += float(getattr(act_fn, "last_root_coverage", 0.0))
             cov_count += 1
@@ -687,12 +697,12 @@ def _eval_policy_episodic(
         "return_wo_lc_std": float(np.std(R0)),
         "return_wo_lc_cvar15": cvar_lower_tail(R0, 0.15),
 
-        # = living_cost * episode_len, per episode, only meaningful when env exposes living_cost
+        # living_cost * episode_len; zero when the env has no living_cost.
         "lc_paid_mean": float(np.mean(R0 - R)),
         "lc_paid_std": float(np.std(R0 - R)),
     }
 
-    # If checkpoint used, aggregate from all episodes (pre-existing + new)
+    # With a checkpoint, aggregate over resumed and new episodes.
     if ckpt is not None:
         return ckpt.to_metrics()
 
@@ -705,6 +715,7 @@ def _eval_policy_episodic(
     return summary, arr, traj_payload
 
 def _delta_metrics(delta: np.ndarray, prefix: str) -> dict:
+    # Mean, std, lower-tail CVaR and fraction of negative values of a paired delta.
     d = np.asarray(delta, dtype=np.float64)
     return {
         f"{prefix}_mean": float(np.mean(d)),
@@ -723,6 +734,7 @@ def eval_ppo_only(
     capture_trajs: bool = False,
     capture_episode_indices: Optional[Set[int]] = None,
 ):
+    """Evaluate the deterministic PPO policy on the real env."""
     def act_fn(obs):
         a, _ = ppo.predict(obs, deterministic=True)
         return a
@@ -750,6 +762,7 @@ def eval_planner(
     capture_episode_indices: Optional[Set[int]] = None,
     ckpt: Optional["_PMEpisodeCheckpoint"] = None,
 ):
+    """Evaluate a planner (any object with act(obs)) on the real env, logging root fallback/coverage."""
     def act_fn(obs):
         a = planner.act(obs)
         act_fn.last_root_fallback = getattr(planner, "last_root_fallback", False)
@@ -773,19 +786,21 @@ def eval_planner(
     return epi_sum, epi_arr, traj_payload
 
 # -------------------------
-# Dataset seeds + collection (REGENERATE per ds, nested via prefix)
+# Dataset seeds and collection (regenerated per ds, nested by prefix)
 # -------------------------
 
 def trajectory_seed_list(exp_seed: int, max_ds: int) -> List[int]:
+    """Return max_ds deterministic trajectory reset seeds for an experiment seed."""
     base = int(exp_seed) * 1_000_000 + 77_777
     return [base + i for i in range(int(max_ds))]
 
 def shuffle_traj_seeds_once(traj_seeds: List[int], exp_seed: int) -> List[int]:
+    """Return a fixed permutation of traj_seeds for exp_seed.
+
+    Datasets use the prefix traj_seeds[:ds], so nesting across ds is preserved while
+    the prefix is not ordered by seed value.
     """
-    Deterministic shuffle to remove 'prefix bias' while preserving prefix nesting:
-    ds always uses traj_seeds[:ds], but traj_seeds is a fixed random permutation per exp_seed.
-    """
-    rng = np.random.default_rng(int(exp_seed) + 123_456)  # fixed per exp seed
+    rng = np.random.default_rng(int(exp_seed) + 123_456)
     ts = list(traj_seeds)
     rng.shuffle(ts)
     return ts
@@ -797,6 +812,11 @@ def collect_dataset_from_traj_seeds(
     traj_seeds: List[int],
     max_steps: int,
 ) -> Dict[str, np.ndarray]:
+    """Roll out the stochastic PPO policy once per reset seed and stack the transitions.
+
+    Returns flat arrays for obs/next obs (observation, achieved_goal, desired_goal),
+    "act", "rew", "done" and "traj_id" (index into traj_seeds).
+    """
     obs_obs, obs_ag, obs_dg = [], [], []
     next_obs_obs, next_obs_ag, next_obs_dg = [], [], []
     acts, rews, dones, traj_ids = [], [], [], []
@@ -842,6 +862,7 @@ def collect_dataset_from_traj_seeds(
     }
 
 def choose_calib_traj_ids(seed: int, max_ds: int, calib_frac: float) -> Set[int]:
+    """Pick the calibration trajectory ids among range(max_ds), fixed per seed."""
     rng = np.random.default_rng(int(seed + 88_888))
     ids = np.arange(int(max_ds), dtype=np.int64)
     rng.shuffle(ids)
@@ -854,6 +875,7 @@ def split_train_calib_by_traj_ids(
     calib_traj_ids_global: Set[int],
     ds: int,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    """Split transitions into (train, calib) by trajectory, using the global ids below ds."""
     traj = np.asarray(data["traj_id"], dtype=np.int64)
     calib_ids = set(i for i in calib_traj_ids_global if int(i) < int(ds))
 
@@ -862,8 +884,7 @@ def split_train_calib_by_traj_ids(
 
 
     def sub(mask):
-        # Keep traj_id so calibration can compute n_calib_traj robustly.
-        # It won't affect model training/calibration because extra keys are ignored.
+        # traj_id is kept for the calibration low-data check; other consumers ignore it.
         out = {k: v[mask] for k, v in data.items()}
         return out
 
@@ -881,11 +902,11 @@ def _obs_i(data: Dict[str, np.ndarray], i: int) -> Dict[str, np.ndarray]:
 # -------------------------
 
 def build_ensemble(obs_dim: int, act_dim: int) -> Any:
-    # Paper Cal-SPI Point Maze ensemble (Tab. calspi-config in the appendix):
-    # K=4, MLP[512,512], 50 training epochs, no bootstrap, no input
-    # normalization. The underlying EnsembleTrainConfig ships with bootstrap
-    # and normalization enabled by default for legacy reasons, so we override
-    # here to match the paper.
+    """Build the PointMaze dynamics ensemble.
+
+    K=4, MLP[512, 512], 50 epochs, no bootstrap and no input normalization
+    (both are enabled in the EnsembleTrainConfig defaults).
+    """
     cfg = EnsembleTrainConfig(
         ensemble_size=4,
         hidden_dims=(512, 512),
@@ -899,6 +920,7 @@ def build_ensemble(obs_dim: int, act_dim: int) -> Any:
         return EnsembleDynamicsSB3(obs_dim, act_dim, cfg)
 
 def fit_ensemble(ens: Any, train: Dict[str, np.ndarray]) -> None:
+    """Fit the ensemble on the training transitions."""
     obs_dicts = {
         "observation": train["obs_observation"],
         "achieved_goal": train["obs_achieved_goal"],
@@ -923,12 +945,13 @@ def make_model_env(
     step_penalty: float = 1.0,
     dist_penalty: float = 0.2,
 ) -> Any:
+    """Wrap the ensemble in a model env for planning (no time-limit truncation)."""
     cfg = ModelEnvConfig(
         continuing_task=bool(int(continuing_task)),
         reward_type=str(reward_type),
         goal_thresh=float(goal_thresh),
         max_steps=int(max_steps),
-        truncate_on_time_limit=False,  # CRITICAL for MCTS
+        truncate_on_time_limit=False,  # planning horizon is set by max_depth only
         living_cost=float(living_cost),
         success_bonus=float(success_bonus),
         reward_mode=str(reward_mode),
@@ -942,10 +965,7 @@ def make_model_env(
 # -------------------------
 
 def _wilks_optimal_bins(N_cal: int, delta: float = 0.05, alpha: float = 0.05) -> int:
-    """
-    Wilks-optimal B*: largest B s.t. N_cal >= (B/delta)*ln(B/alpha).
-    Eq. ncal-wilks in pac_guarantees.tex.  Mirrors benchmark_continuous.py.
-    """
+    """Largest bin count B with N_cal >= (B/delta) * ln(B/alpha); same rule as benchmark_continuous.py."""
     if N_cal <= 0:
         return 1
     lo, hi = 1, N_cal
@@ -959,7 +979,7 @@ def _wilks_optimal_bins(N_cal: int, delta: float = 0.05, alpha: float = 0.05) ->
 
 
 def _wilks_min_n_per_bin(n_bins: int, delta: float = 0.05, alpha: float = 0.05) -> int:
-    """Per-bin minimum: ceil(ln(alpha/n_bins) / ln(1-delta)).  Bonferroni-corrected."""
+    """Wilks per-bin minimum sample count ceil(ln(alpha/n_bins) / ln(1-delta)) (Bonferroni)."""
     if n_bins <= 0 or delta <= 0 or delta >= 1:
         return 0
     alpha_b = alpha / max(1, n_bins)
@@ -977,24 +997,34 @@ def fit_calibrator_and_eps(
     delta: float,
     min_samples: int,
     max_steps: int,
-    stochastic: bool = False,   # if True: e_i = E_{k,eps}[||s'_stoch - s'_true||]
-    n_eps: int = 10,            # noise samples per member (only used when stochastic=True)
+    stochastic: bool = False,   # e_i = E_{k,eps}[||s'_sample - s'_true||] instead of mean error
+    n_eps: int = 10,            # noise samples per member when stochastic=True
 ) -> Tuple[Any, float]:
+    """Fit the calibrated bound B(u) and the gate threshold eps on D_cal.
+
+    Computes u = u_USAD or u_VAR (kind) and the one-step error e = ||mu_bar(s,a) - s'||_2
+    for every calibration transition, then fits B(u) with the triple split
+    D_bin / D_wilks / D_thr and selection over candidate bin counts. When the data are
+    insufficient (too few trajectories, samples or distinct u values), returns a
+    calibrator flagged low_data_regime with eps=1e9, so the planner collapses to PPO.
+
+    Returns:
+        (calibrator, eps).
+    """
     N = int(calib["act"].shape[0])
 
-    # ── Wilks-optimal B* (eq. ncal-wilks in pac_guarantees.tex) ──────────────
-    # If n_bins=0 (auto mode): compute B* = max B s.t. N >= (B/delta)*ln(B/alpha).
-    # Also derives the Wilks per-bin minimum for min_bin_size.
+    # ── Bin count ──
+    # n_bins=0: Wilks-optimal B* = max B with N >= (B/delta) ln(B/alpha), and the
+    # Wilks per-bin minimum as min_bin_size.
     if int(n_bins) == 0:
         n_bins = _wilks_optimal_bins(N, float(delta))
         _min_bin_size = _wilks_min_n_per_bin(n_bins, float(delta))
     else:
         n_bins = int(n_bins)
-        _min_bin_size = int(min_samples)  # legacy: min_samples used as min_bin_size
+        _min_bin_size = int(min_samples)
 
-    # calib_min_bins derived from eps_quantile: ceil(1/(1-eps_quantile)).
-    # With B < ceil(1/(1-q)), the q-quantile of B(u) equals B_last, making
-    # the gate always pass for OOD actions.  (See calib_min_bins_check docstring.)
+    # With B < ceil(1/(1-q_eps)) the q_eps-quantile of B(u) equals the last bin bound,
+    # so the gate admits every action. Reported in the diagnostics below.
     _calib_min_bins = math.ceil(1.0 / (1.0 - float(eps_quantile)))
 
     if N <= 0:
@@ -1003,7 +1033,7 @@ def fit_calibrator_and_eps(
             np.array([1e9], dtype=np.float64),
             cfg=UncertaintyCalibratorConfig(n_bins=2, delta=float(delta), min_samples=int(min_samples)),
         )
-        # IMPORTANT: planner checks cal.meta["low_data_regime"]
+        # The planner reads cal.meta["low_data_regime"]
         cal.meta = dict(getattr(cal, "meta", {}) or {})
         cal.meta["kind"] = str(kind)
         cal.meta["low_data_regime"] = True
@@ -1027,11 +1057,7 @@ def fit_calibrator_and_eps(
         true_next = np.asarray(calib["next_observation"][i], dtype=np.float32).ravel()
 
         if stochastic:
-            # Stochastic calibration: e_i = E_{k, eps}[ ||s'_stoch - s'_true|| ]
-            # Samples K members × n_eps noise draws → mean error over the full
-            # transition distribution, not just the ensemble mean.
-            # This gives a tighter, more rigorous bound on the error of the
-            # actual stochastic transitions used during MCTS planning.
+            # e_i = mean over K members x n_eps noise draws of ||s'_sample - s'_true||.
             K = len(ens.ensemble)
             calib_rng = np.random.default_rng(int(seed) + i)
             sample_errors = []
@@ -1045,7 +1071,7 @@ def fit_calibrator_and_eps(
                     )
             ei = float(np.mean(sample_errors))
 
-            # DEBUG (sparse)
+            # Debug output for a few indices.
             if i in (0, 1, 2, N - 1):
                 print(
                     f"[CALIB DBG STOCH] kind={kind} i={i} K={K} n_eps={n_eps} "
@@ -1053,13 +1079,11 @@ def fit_calibrator_and_eps(
                     flush=True,
                 )
         else:
-            # Deterministic calibration: e_i = ||mean_k[mu_k] - s'_true||
-            # Measures systematic (bias) error of the ensemble mean estimator.
+            # e_i = ||mu_bar(s,a) - s'_true||_2 (ensemble-mean error).
             pred_next = ens.predict_next_obs_vec_mean(obs, act)
             pred_next_arr = np.asarray(pred_next, np.float32).ravel()
             ei = float(np.linalg.norm(pred_next_arr - true_next, ord=2))
 
-            # DEBUG
             if i in (0, 1, 2, N - 1):
                 _dbg_shape("pred_next", pred_next_arr, "true_next", true_next)
                 print(f"[CALIB DBG] kind={kind} i={i}", flush=True)
@@ -1070,42 +1094,39 @@ def fit_calibrator_and_eps(
         u[i] = ui
         e[i] = ei
 
-    # DEBUG
     _dbg_stats(f"u ({kind})", u)
     _dbg_stats(f"e L2(pred_next - next_observation) ({kind})", e)
 
-    # -------------------------
-    # Robust low-data detection for QUANTILE BINNING (paper-friendly)
-    # -------------------------
+    # ── Low-data detection ──
     B = int(n_bins)
     m = int(min_samples)
     N_eff = int(u.shape[0])
 
-    # (A) Hard feasibility: if total points < bins*min_samples, quantile binning cannot meet per-bin minimum.
+    # (A) Fewer than B * min_samples points: quantile bins cannot meet the per-bin minimum.
     low_data_by_counts = (N_eff < B * m)
 
-    # (B) Need at least a couple trajectories to avoid degenerate calibration.
+    # (B) At least T_MIN calibration trajectories.
     T_MIN = 2
     if "traj_id" in calib:
         traj_ids_raw = np.asarray(calib["traj_id"]).reshape(-1)
-        # Robust mapping even if traj_id are arbitrary (not contiguous / not starting at 0)
+        # traj_id values need not be contiguous.
         _, inv = np.unique(traj_ids_raw, return_inverse=True)
         n_calib_traj = int(inv.max() + 1) if inv.size > 0 else 0
         counts = np.bincount(inv) if inv.size > 0 else np.asarray([], dtype=np.int64)
         L_med = int(np.median(counts)) if counts.size > 0 else 0
     else:
-        # Conservative fallback if traj_id is missing: treat as 1 trajectory of length N_eff
+        # Without traj_id, treat the data as one trajectory of length N_eff.
         n_calib_traj = 1
         L_med = int(N_eff)
 
-    # (C) Data-driven effective horizon per trajectory: median traj length, capped by episode horizon.
-    # This avoids an arbitrary fixed L_EFF (e.g., 50) while still accounting for correlation.
+    # (C) Effective samples per trajectory: median trajectory length, capped by max_steps,
+    # to account for within-trajectory correlation.
     L_eff = int(min(int(max_steps), max(1, L_med)))
 
     low_data_by_traj = (n_calib_traj < T_MIN)
     low_data_by_eff = (n_calib_traj * L_eff < B * m)
 
-    # Optional degeneracy check on u: if too few unique values, quantile binning collapses.
+    # (D) Too few distinct u values make quantile bins degenerate.
     avg_per_bin = float(N_eff) / float(max(1, B))
     n_unique_u = int(np.unique(u).shape[0])
     low_data_by_unique = (n_unique_u < max(5, B // 2))
@@ -1122,8 +1143,8 @@ def fit_calibrator_and_eps(
         flush=True,
     )
 
-    # If low-data, do NOT fit a real calibrator (claim: B(u) not reliable).
-    # Return a dummy calibrator that forces PPO-only via meta["low_data_regime"] and eps=1e9.
+    # Low-data regime: return a placeholder calibrator flagged low_data_regime with
+    # eps=1e9; the planner then executes the PPO action (conservative collapse).
     if force_low_data:
         cal = UncertaintyCalibrator.fit(
             np.array([0.0], dtype=np.float64),
@@ -1137,9 +1158,8 @@ def fit_calibrator_and_eps(
         setattr(cal, "low_data_regime", True)
         return cal, float(1e9)
 
-    # ── NEW: Wilks-strict + triple-split + Bonferroni candidate sweep ────────
-    # Aligned with continuous benchmark calibration pipeline. See
-    # safe_rl/offline/uncertainty_calibration.py: fit_with_selection.
+    # ── Triple split + Wilks-strict fit + Bonferroni selection over B ──
+    # Same procedure as the continuous benchmark (UncertaintyCalibrator.fit_with_selection).
     rng_split = np.random.default_rng(0)
     perm = rng_split.permutation(int(N_eff))
     n1 = int(N_eff) // 3
@@ -1147,13 +1167,12 @@ def fit_calibrator_and_eps(
     idx_wilks = perm[n1:2 * n1]
     idx_thr   = perm[2 * n1:]
 
-    # Paper-canonical candidate set: B_min = ceil(1/(1-q_eps)) and linear
-    # multiples {Bm, 2 Bm, 3 Bm, 4 Bm}. For the paper q_eps = 0.95 this yields
-    # the canonical {20, 40, 60, 80} reported in Tab. calspi-config.
+    # Candidates {Bm, 2Bm, 3Bm, 4Bm} with Bm = ceil(1/(1-q_eps)); q_eps=0.95 gives
+    # {20, 40, 60, 80}.
     Bm = int(math.ceil(1.0 / max(1e-12, 1.0 - float(eps_quantile))))
     cand_list = [int(Bm * (k + 1)) for k in range(4)]
 
-    # Pass 1: bin edges on D_bin, one set per B
+    # Quantile bin edges on D_bin, one set per candidate B (strictly increasing).
     u_bin = u[idx_bin]
     bin_edges_per_B: dict = {}
     for B in cand_list:
@@ -1195,7 +1214,7 @@ def fit_calibrator_and_eps(
                     "eps_selected": float(np.quantile(cal.bound_batch(u), float(eps_quantile)))}
         eps_raw = sel_diag["eps_selected"]
 
-    # Console diagnostics (paper-grade)
+    # Per-candidate selection table.
     print(f"[CALIB] Triple-split + candidate sweep: "
           f"N_cal={int(N_eff)} (bin={idx_bin.size}, wilks={idx_wilks.size}, thr={idx_thr.size}); "
           f"candidates={cand_list}", flush=True)
@@ -1224,17 +1243,14 @@ def fit_calibrator_and_eps(
     print(f"[CALIB DBG] kind={kind} q_eps={float(eps_quantile):.4f} -> "
           f"eps={eps_emp:.6g} B_dagger={sel_B} collapsed={int(collapsed)}", flush=True)
 
-    # ── min_bins check (Wilks discriminability, eq. calib_min_bins in paper) ──
-    # With B_eff < ceil(1/(1-eps_quantile)), the eps_quantile-quantile of B(u)
-    # equals B_last, so OOD actions always pass the gate.  Force low_data_regime.
-    # NEW Wilks-strict + triple-split summary (replaces legacy min_bins block)
+    # ── Calibration summary ──
     _sep = "\u2500" * 54
     print(f"\n[CALIB/{kind.upper()}] {_sep}", flush=True)
     print(f"  N_cal={int(N_eff)} | delta={delta} | q_eps={eps_quantile} | alpha=0.05", flush=True)
     print(f"  candidates B       : {cand_list}", flush=True)
     print(f"  triple split       : D_bin={idx_bin.size}, D_wilks={idx_wilks.size}, D_thr={idx_thr.size}", flush=True)
     if collapsed:
-        print(f"  -> COLLAPSE: admissible set empty -> eps=-inf, fallback PPO (Prop. 2)", flush=True)
+        print(f"  -> COLLAPSE: admissible set empty -> eps=-inf, fallback PPO", flush=True)
     else:
         print(f"  B_dagger           : {sel_B}", flush=True)
         print(f"  eps                : {eps_emp:.4f}", flush=True)
@@ -1250,126 +1266,12 @@ def fit_calibrator_and_eps(
 
     return cal, eps_emp
 
-# def fit_calibrator_and_eps(
-#     *,
-#     ens: Any,
-#     calib: Dict[str, np.ndarray],
-#     kind: str,  # "usad" | "epistemic"
-#     seed: int,
-#     eps_quantile: float,
-#     n_bins: int,
-#     delta: float,
-#     min_samples: int,
-# ) -> Tuple[Any, float]:
-#     # N = int(calib["act"].shape[0])
-#     # if N <= 0:
-#     #     cal = UncertaintyCalibrator.fit(
-#     #         np.array([0.0], dtype=np.float64),
-#     #         np.array([1e9], dtype=np.float64),
-#     #         cfg=UncertaintyCalibratorConfig(n_bins=2, delta=float(delta), min_samples=int(min_samples)),
-#     #     )
-#     #     setattr(cal, "low_data_regime", True)
-#     #     return cal, float(1e9)
-#     N = int(calib["act"].shape[0])
-#     if N <= 0:
-#         cal = UncertaintyCalibrator.fit(
-#             np.array([0.0], dtype=np.float64),
-#             np.array([1e9], dtype=np.float64),
-#             cfg=UncertaintyCalibratorConfig(n_bins=2, delta=float(delta), min_samples=int(min_samples)),
-#         )
-#         # IMPORTANT: planner checks cal.meta["low_data_regime"]
-#         cal.meta = dict(getattr(cal, "meta", {}) or {})
-#         cal.meta["kind"] = str(kind)
-#         cal.meta["low_data_regime"] = True
-#         return cal, float(1e9)
-
-#     u = np.zeros((N,), dtype=np.float64)
-#     e = np.zeros((N,), dtype=np.float64)
-
-#     for i in range(N):
-#         obs = _obs_i(calib, i)
-#         act = calib["act"][i]
-#         if kind == "usad":
-#             ui = float(ens.uncertainty_usad(obs, act))
-#         else:
-#             ui = float(ens.uncertainty_epistemic(obs, act))
-
-#         pred_next = ens.predict_next_obs_vec_mean(obs, act)
-#         true_next = np.asarray(calib["next_observation"][i], dtype=np.float32).ravel()
-#         # DEBUG
-#         if i in (0, 1, 2, N - 1):
-#             pred_next_arr = np.asarray(pred_next, np.float32).ravel()
-#             _dbg_shape("pred_next", pred_next_arr, "true_next", true_next)
-#             print(f"[CALIB DBG] kind={kind} i={i}", flush=True)
-#             _dbg_stats("pred_next (single)", pred_next_arr)
-#             _dbg_stats("true_next (single)", true_next)
-#             _dbg_stats("diff (single)", pred_next_arr - true_next)
-
-#         ei = float(np.linalg.norm(np.asarray(pred_next, np.float32).ravel() - true_next, ord=2))
-
-#         u[i] = ui
-#         e[i] = ei
-        
-#     # DEBUG
-#     _dbg_stats(f"u ({kind})", u)
-#     _dbg_stats(f"e L2(pred_next - next_observation) ({kind})", e)
-
-#     # -------------------------
-#     # Robust low-data detection for QUANTILE BINNING
-#     # -------------------------
-#     N = int(u.shape[0])
-#     B = int(n_bins)
-#     m = int(min_samples)
-
-#     # In quantile binning, each bin should have ~N/B points.
-#     # If N < B*m, it is impossible (in expectation) to have >= m samples per bin.
-#     # This is a robust, statistic-based trigger.
-#     avg_per_bin = float(N) / float(max(1, B))
-#     low_data_by_counts = (N < B * m)
-
-#     # Additional robust checks (avoid degenerate u distributions):
-#     # - If u has too few unique values, quantile binning collapses.
-#     # - Use a conservative threshold tied to B.
-#     n_unique_u = int(np.unique(u).shape[0])
-#     low_data_by_unique = (n_unique_u < max(5, B // 2))
-
-#     force_low_data = bool(low_data_by_counts or low_data_by_unique)
-
-#     print(
-#         f"[CALIB DBG] low-data check kind={kind} | "
-#         f"N={N} bins={B} min_samples={m} avg_per_bin={avg_per_bin:.2f} "
-#         f"unique_u={n_unique_u} -> low_data={int(force_low_data)}",
-#         flush=True,
-#     )
-
-#     cal = UncertaintyCalibrator.fit(
-#         u,
-#         e,
-#         cfg=UncertaintyCalibratorConfig(
-#             n_bins=int(n_bins),
-#             delta=float(delta),
-#             binning="quantile",
-#             min_samples=int(min_samples),
-#             monotone=True,
-#         ),
-#         meta={"kind": str(kind)},
-#     )
-#     setattr(cal, "low_data_regime", bool(cal.meta.get("low_data_regime", False)))
-
-#     b = cal.bound_batch(u)
-#     # DEBUG
-#     _dbg_stats(f"b = cal.bound_batch(u) ({kind})", b)
-#     eps_emp = float(np.quantile(b, float(eps_quantile)))
-#     print(f"[CALIB DBG] kind={kind} eps_quantile={float(eps_quantile):.4f} -> eps_emp={eps_emp:.6g}", flush=True)
-#     pass_frac = float(np.mean(np.asarray(b) <= eps_emp))
-#     print(f"[CALIB DBG] kind={kind} calib pass fraction ~ {pass_frac:.3f}", flush=True)
-#     return cal, eps_emp
-
 # -------------------------
 # Plotting
 # -------------------------
 
 def plot_metric(df, xcol: str, ycol: str, out_path: str, title: str) -> None:
+    """Plot the per-method mean of ycol against xcol."""
     plt.figure()
     for method in sorted(df["method"].unique()):
         sub = df[df["method"] == method]
@@ -1386,11 +1288,11 @@ def plot_metric(df, xcol: str, ycol: str, out_path: str, title: str) -> None:
     plt.close()
 
 PAPER_STYLE = {
-    # method_key_in_df : dict(label=..., color=..., marker=..., linestyle=..., markersize=..., linewidth=...)
+    # method key -> matplotlib line style.
     "ppo_only": {
         "label": "Baseline",
         "color": "yellow",
-        "marker": None,          # no points
+        "marker": None,
         "linestyle": "-",
         "markersize": 0,
         "linewidth": 2.5,
@@ -1398,7 +1300,7 @@ PAPER_STYLE = {
     "mcts_only_no_gate": {
         "label": "MCTS-DPW",
         "color": "blue",
-        "marker": "v",           # triangle down
+        "marker": "v",
         "linestyle": "-",
         "markersize": 7,
         "linewidth": 2.0,
@@ -1406,7 +1308,7 @@ PAPER_STYLE = {
     "morel_usad": {
         "label": "SPI-U",
         "color": "purple",
-        "marker": "s",           # square
+        "marker": "s",
         "linestyle": "-",
         "markersize": 6,
         "linewidth": 2.0,
@@ -1433,11 +1335,7 @@ PAPER_METHOD_ORDER = ["ppo_only", "mcts_only_no_gate", "morel_usad", "calibrated
 
 
 def _paper_aggregate(df: pd.DataFrame, metric: str) -> pd.DataFrame:
-    """
-    Aggregate metric over seeds for each (dataset_trajs, method).
-    Expects columns: dataset_trajs, method, seed, metric.
-    Returns columns: dataset_trajs, method, mean, std.
-    """
+    """Mean and std of metric over seeds per (dataset_trajs, method); std is 0 for one seed."""
     req = {"dataset_trajs", "method", metric}
     missing = req - set(df.columns)
     if missing:
@@ -1445,19 +1343,15 @@ def _paper_aggregate(df: pd.DataFrame, metric: str) -> pd.DataFrame:
 
     g = df.groupby(["dataset_trajs", "method"], as_index=False)[metric]
     out = g.agg(mean="mean", std="std")
-    # Replace NaN std (single seed) with 0.0 to avoid issues
     out["std"] = out["std"].fillna(0.0)
     return out
 
 
 def _paper_plot_one(df: pd.DataFrame, metric: str, outpath_svg: str, ylabel: str):
-    """
-    Paper-ready plot: no title, fixed x label (latex), legend with requested labels/styles.
-    Saves SVG (overwrites).
-    """
+    """Plot mean metric vs dataset size for the methods in PAPER_STYLE and save as SVG."""
     agg = _paper_aggregate(df, metric)
 
-    # Keep only known methods, enforce order
+    # Known methods only, in PAPER_METHOD_ORDER.
     methods_present = [m for m in PAPER_METHOD_ORDER if m in set(agg["method"].unique())]
 
     fig = plt.figure()
@@ -1485,15 +1379,12 @@ def _paper_plot_one(df: pd.DataFrame, metric: str, outpath_svg: str, ylabel: str
     ax.legend(frameon=False)
     fig.tight_layout()
 
-    # SVG ignores DPI in raster sense, but matplotlib accepts dpi; keep as requested
     fig.savefig(outpath_svg, format="svg", dpi=300)
     plt.close(fig)
 
 
 def plot_three_paper_ready(df: pd.DataFrame, outdir: str):
-    """
-    Writes 3 SVG plots (overwrites each time).
-    """
+    """Write plot_mean.svg, plot_cvar.svg and plot_success.svg to outdir."""
     os.makedirs(outdir, exist_ok=True)
 
     _paper_plot_one(
@@ -1517,32 +1408,25 @@ def plot_three_paper_ready(df: pd.DataFrame, outdir: str):
 
 
 def save_checkpoint(df: pd.DataFrame, outdir: str):
-    """
-    Overwrites:
-      - results_checkpoint.csv
-      - results_checkpoint.json
-      - plot_mean.svg, plot_cvar.svg, plot_success.svg
-    """
+    """Write results_checkpoint.csv/.json and the three summary SVG plots (overwriting)."""
     os.makedirs(outdir, exist_ok=True)
 
     ckpt_csv = os.path.join(outdir, "results_checkpoint.csv")
     ckpt_json = os.path.join(outdir, "results_checkpoint.json")
 
-    # CSV
     df.to_csv(ckpt_csv, index=False)
 
-    # JSON (nested)
     nested = df_to_nested_json(df)
     with open(ckpt_json, "w") as f:
         json.dump(nested, f, indent=2)
 
-    # Plots
     plot_three_paper_ready(df, outdir)
 
     print(f"[CHECKPOINT] wrote {ckpt_csv} + {ckpt_json} + updated SVG plots", flush=True)
 
 
 def df_to_nested_json(df: pd.DataFrame):
+    """Return {seed: {dataset_trajs: {method: headline metrics}}}."""
     out = {}
     for _, row in df.iterrows():
         s = int(row["seed"])
@@ -1565,9 +1449,7 @@ def df_to_nested_json(df: pd.DataFrame):
     return out
 
 def save_dataset_cache(outdir, seed, ds, data, train, calib, *, traj_seeds_used, calib_traj_ids_global):
-    """
-    Save full transitions + train/calib split + metadata needed for exact reuse.
-    """
+    """Save the full dataset, the train/calib split and metadata (seeds, ids, SHA-256)."""
     cache_dir = os.path.join(outdir, "cache", f"seed_{seed}", f"ds_{ds}")
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -1575,13 +1457,8 @@ def save_dataset_cache(outdir, seed, ds, data, train, calib, *, traj_seeds_used,
     tr_path = os.path.join(cache_dir, "transitions_train.npz")
     cal_path = os.path.join(cache_dir, "transitions_calib.npz")
 
-    # Full dataset (includes traj_id)
     np.savez_compressed(full_path, **data)
-
-    # Train split
     np.savez_compressed(tr_path, **train)
-
-    # Calibration split
     np.savez_compressed(cal_path, **calib)
 
     meta = {
@@ -1589,7 +1466,7 @@ def save_dataset_cache(outdir, seed, ds, data, train, calib, *, traj_seeds_used,
         "dataset_trajs": int(ds),
         "traj_seeds_used": [int(x) for x in traj_seeds_used],  # length = ds
         "calib_traj_ids_global": sorted([int(x) for x in calib_traj_ids_global]),
-        # NOTE: effective calib ids are global filtered by < ds; save both so you can reconstruct
+        # Effective calibration ids: the global ids below ds.
         "calib_traj_ids_effective": sorted([int(x) for x in calib_traj_ids_global if int(x) < int(ds)]),
         "counts": {
             "full_transitions": int(data["act"].shape[0]),
@@ -1603,7 +1480,7 @@ def save_dataset_cache(outdir, seed, ds, data, train, calib, *, traj_seeds_used,
         },
     }
 
-    # Hash files to ensure exact identity across future runs
+    # Hashes identify the exact cached files.
     meta["sha256"] = {
         "transitions_full": sha256_file(full_path),
         "transitions_train": sha256_file(tr_path),
@@ -1616,6 +1493,7 @@ def save_dataset_cache(outdir, seed, ds, data, train, calib, *, traj_seeds_used,
     print(f"[CACHE] dataset saved at {cache_dir}", flush=True)
 
 def save_calibrator_cache(outdir, seed, ds, *, name: str, calibrator, eps: float):
+    """Pickle a calibrator and save its eps and metadata in the (seed, ds) cache."""
     cache_dir = os.path.join(outdir, "cache", f"seed_{seed}", f"ds_{ds}")
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -1648,6 +1526,7 @@ def save_calibrator_cache(outdir, seed, ds, *, name: str, calibrator, eps: float
     print(f"[CACHE] calibrator '{name}' saved at {cal_path}", flush=True)
 
 def save_ensemble_cache(outdir, seed, ds, ensemble, *, obs_dim: int, act_dim: int, ensemble_cfg=None):
+    """Save the ensemble (state_dict, or the whole object as fallback) and its metadata."""
     cache_dir = os.path.join(outdir, "cache", f"seed_{seed}", f"ds_{ds}")
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -1677,6 +1556,7 @@ def save_ensemble_cache(outdir, seed, ds, ensemble, *, obs_dim: int, act_dim: in
     print(f"[CACHE] ensemble saved at {model_path}", flush=True)
 
 def save_config_cache(outdir, seed, ds, *, args, base_cfg, model_env_cfg, methods_cfg: dict):
+    """Save CLI args and planner/model-env configs of a (seed, ds) cell as JSON."""
     cache_dir = os.path.join(outdir, "cache", f"seed_{seed}", f"ds_{ds}")
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -1699,7 +1579,7 @@ def save_config_cache(outdir, seed, ds, *, args, base_cfg, model_env_cfg, method
 # ── Cache loading helpers ─────────────────────────────────────────────────────
 
 def load_dataset_cache(outdir: str, seed: int, ds: int):
-    """Load train/calib splits from NPZ cache. Returns (train_dict, calib_dict)."""
+    """Load the cached train/calib splits. Returns (train, calib)."""
     cache_dir = os.path.join(outdir, "cache", f"seed_{seed}", f"ds_{ds}")
     tr_path  = os.path.join(cache_dir, "transitions_train.npz")
     cal_path = os.path.join(cache_dir, "transitions_calib.npz")
@@ -1712,7 +1592,7 @@ def load_dataset_cache(outdir: str, seed: int, ds: int):
 
 
 def load_ensemble_cache(outdir: str, seed: int, ds: int, obs_dim: int, act_dim: int):
-    """Load pre-trained MSE ensemble from PT cache. Returns EnsembleDynamicsSB3."""
+    """Load the trained MSE ensemble from the cache."""
     cache_dir  = os.path.join(outdir, "cache", f"seed_{seed}", f"ds_{ds}")
     meta_path  = os.path.join(cache_dir, "ensemble_meta.json")
     model_path = os.path.join(cache_dir, "ensemble.pt")
@@ -1735,7 +1615,7 @@ def load_ensemble_cache(outdir: str, seed: int, ds: int, obs_dim: int, act_dim: 
 
 
 def load_calibrator_cache(outdir: str, seed: int, ds: int, name: str):
-    """Load calibrator + eps from PKL/JSON cache. Returns (calibrator, eps)."""
+    """Load a cached calibrator and its eps. Returns (calibrator, eps)."""
     cache_dir = os.path.join(outdir, "cache", f"seed_{seed}", f"ds_{ds}")
     cal_path  = os.path.join(cache_dir, f"calibrator_{name}.pkl")
     eps_path  = os.path.join(cache_dir, f"eps_{name}.json")
@@ -1752,6 +1632,7 @@ def load_calibrator_cache(outdir: str, seed: int, ds: int, name: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sanitize_for_df(x):
+    # Scalars/arrays to Python values, containers to JSON strings (one CSV cell each).
     if isinstance(x, (np.generic,)):
         return x.item()
     if isinstance(x, np.ndarray):
@@ -1768,7 +1649,7 @@ def _sanitize_for_df(x):
 # -------------------------
 
 def main() -> None:
-    
+    """Run the PointMaze benchmark over all (seed, dataset size, method) cells."""
     ap = argparse.ArgumentParser()
 
     ap.add_argument(
@@ -1776,7 +1657,7 @@ def main() -> None:
         type=int,
         default=1,
         choices=[0, 1],
-        help="If 1, shuffle traj seeds once per exp seed to remove prefix bias while keeping nesting.",
+        help="If 1, permute the trajectory seeds once per seed; datasets stay nested prefixes.",
     )
 
     ap.add_argument("--outdir", type=str, default="out_pointmaze_gates_full")
@@ -1799,42 +1680,42 @@ def main() -> None:
     ap.add_argument("--calib_delta", type=float, default=0.05)
     ap.add_argument("--calib_min_samples", type=int, default=50)
     ap.add_argument("--calib_stochastic", type=int, default=0, choices=[0, 1],
-                    help="If 1, calibrate e_i using stochastic ensemble samples "
-                         "(E_{k,eps}[||s'_stoch - s'_true||]) instead of ensemble mean. "
-                         "More rigorous bound, slightly more conservative.")
+                    help="If 1, e_i is the mean error of sampled ensemble transitions "
+                         "(E_{k,eps}[||s'_sample - s'_true||]) instead of the ensemble-mean error.")
     ap.add_argument("--calib_n_eps", type=int, default=10,
-                    help="Noise samples per member for stochastic calibration (default: 10).")
+                    help="Noise samples per member for stochastic calibration.")
 
     ap.add_argument("--eps_quantile", type=float, default=0.95)
     ap.add_argument("--eps_from_calibration", type=int, default=1, choices=[0, 1])
     ap.add_argument("--eps", type=float, default=0.10)
     ap.add_argument("--tau", type=float, default=0.2,
-                    help="USAD threshold for the heuristic MOReL gate baseline "
-                         "(default 0.2 matches the paper Cal-SPI / MOReL setup).")
+                    help="USAD threshold of the heuristic MOReL-style gate (morel_usad).")
 
     ap.add_argument("--num_sims", type=int, default=200)
     ap.add_argument("--max_depth", type=int, default=20)
     ap.add_argument("--gamma", type=float, default=0.99)
     ap.add_argument("--eval_episodes", type=int, default=10,
-                    help="Number of evaluation episodes per (ds, seed) cell "
-                         "(default 10 matches the paper Point Maze setup).")
+                    help="Evaluation episodes per (ds, seed) cell.")
     ap.add_argument("--dpw_k", type=float, default=2.0,
                     help="DPW widening constant kappa (max children = floor(kappa * N^alpha))")
     ap.add_argument("--dpw_alpha", type=float, default=0.5,
                     help="DPW widening exponent alpha")
     ap.add_argument("--c_puct", type=float, default=1.5,
                     help="PUCT exploration constant")
+    ap.add_argument("--mcts_backend", type=str, default="array",
+                    choices=["parametric", "array"],
+                    help="'parametric': reference Python/torch planner. "
+                         "'array': compiled search loop (mcts_array_pointmaze), "
+                         "same tree, widening, reward, leaf value and gate.")
     ap.add_argument("--n_actions_root", type=int, default=64,
-                    help="Number of root candidate actions sampled at decision time")
+                    help="Root candidate actions sampled at decision time")
     ap.add_argument("--n_actions_per_node", type=int, default=16,
                     help="Per-node cap on candidate actions (non-root)")
     ap.add_argument("--ppo_std_scale", type=float, default=0.1,
                     help="Std-dev scale for PPO-anchored action sampling")
-    # Reward configuration. Defaults below match the paper Cal-SPI Point Maze
-    # setup (dense + speed_distance + success_bonus=1500). The PPO baseline must
-    # be trained with the same reward configuration, which is what
-    # train_ppo_pointmaze.py defaults to and what run_benchmark_pointmaze.sh
-    # forwards.
+    # Reward configuration (dense, speed_distance, success_bonus=1500). The PPO
+    # baseline must use the same configuration; train_ppo_pointmaze.py has the same
+    # defaults.
     ap.add_argument("--living_cost", type=float, default=0.0)
     ap.add_argument("--success_bonus", type=float, default=1500.0)
     ap.add_argument("--reward_mode", type=str, default="speed_distance",
@@ -1847,83 +1728,78 @@ def main() -> None:
     ap.add_argument("--traj_out_subdir", type=str, default="traj_debug")
     ap.add_argument("--plot_trajs", type=int, default=1, choices=[0, 1])
 
-    # --- Debug visualizer arguments ---
+    # Debug visualizer.
     ap.add_argument(
         "--debug_episodes",
         type=int,
         default=0,
-        help="Number of episodes to run with LoggingMCTS for debug plots. "
-             "0 = disabled. Recommended: 2-3.",
+        help="Episodes run with LoggingMCTS for debug plots (0 = disabled).",
     )
     ap.add_argument(
         "--debug_ds",
         type=int,
         nargs="*",
         default=[],
-        help="Dataset sizes for which to run debug plots. "
-             "Empty = all sizes. Example: --debug_ds 100 300",
+        help="Dataset sizes with debug plots (empty = all). Example: --debug_ds 100 300",
     )
     ap.add_argument(
         "--debug_methods",
         type=str,
         nargs="*",
         default=["calibrated_usad", "morel_usad"],
-        help="Which methods to run debug plots for. "
-             "Default: calibrated_usad morel_usad",
+        help="Methods with debug plots.",
     )
     ap.add_argument(
         "--debug_log_sims",
         type=int,
         default=1,
         choices=[0, 1],
-        help="If 1, log internal simulation paths (needed for Plot 2). ~10%% overhead.",
+        help="If 1, log simulated paths inside the tree (required for the simulation plot).",
     )
     ap.add_argument(
         "--debug_sim_steps",
         type=int,
         nargs="*",
         default=None,
-        help="Which real steps to generate Plot 2 for. "
-             "None = every 5 steps. Example: --debug_sim_steps 0 5 10 20",
+        help="Real-env steps with a simulation plot (default: every 5 steps). "
+             "Example: --debug_sim_steps 0 5 10 20",
     )
     ap.add_argument(
         "--run_methods",
         type=str,
         nargs="*",
         default=None,
-        help="Restrict which methods are evaluated. "
-             "None = all. Example: --run_methods calibrated_variance morel_usad",
+        help="Evaluate only these methods (default: all). "
+             "Example: --run_methods calibrated_variance morel_usad",
     )
 
-    # --- Offline RL baseline arguments ---
+    # Offline RL baselines.
     ap.add_argument(
         "--baseline_epochs",
         type=int,
         default=200,
-        help="Training epochs for offline RL baselines (IQL, TD3+BC, MOReL-full, MOPO-MSE). "
-             "Default: 200. Use a smaller value (e.g. 50) for quick validation.",
+        help="Training epochs for the offline RL baselines.",
     )
     ap.add_argument(
         "--baseline_rollout_batch",
         type=int,
         default=1000,
-        help="Number of model-rollout starting states per epoch for model-based baselines "
-             "(MOReL-full, MOPO-MSE). Capped at len(D_train) automatically. Default: 1000.",
+        help="Model-rollout start states per epoch for MOReL-full and MOPO-MSE "
+             "(capped at len(D_train)).",
     )
     ap.add_argument(
         "--load_from_cache",
         type=int,
         default=0,
         choices=[0, 1],
-        help="If 1, skip dataset collection + ensemble training + calibration and load "
-             "pre-computed structures from the cache directory (produced by a previous run). "
-             "Use this to run baselines only on top of an existing Cal-SPI result directory.",
+        help="If 1, load dataset, ensemble and calibrators from <outdir>/cache "
+             "instead of collecting, training and calibrating.",
     )
 
     args = ap.parse_args()
     ensure_dir(args.outdir)
 
-    # ---- PPO train-once / load ----
+    # ── PPO behavior policy: train once, then load ──
     if int(args.ppo_train_once) == 1 and (not os.path.exists(args.ppo_global_path)):
         run_ppo_training_to_path(
             train_ppo_script=str(args.train_ppo_script),
@@ -1948,19 +1824,17 @@ def main() -> None:
     rows: List[Dict[str, Any]] = []
     traj_plot_store: Dict[Tuple[int, int], Dict[str, List[Dict[str, Any]]]] = {}
 
-    # When loading from cache, pre-populate rows with all existing results so they
-    # are preserved in the final CSV (only rows for methods in --run_methods will be
-    # re-run and overwritten; all others are kept as-is).
+    # With --load_from_cache, keep existing rows of methods not in --run_methods;
+    # the selected methods are re-run.
     _active_methods_global = set(args.run_methods) if args.run_methods else None
     if int(args.load_from_cache) == 1:
         ckpt_path = os.path.join(args.outdir, "results_checkpoint.csv")
         if os.path.exists(ckpt_path):
             df_existing = pd.read_csv(ckpt_path)
-            # Keep rows for methods that are NOT being re-run
             if _active_methods_global is not None:
                 df_keep = df_existing[~df_existing["method"].isin(_active_methods_global)]
             else:
-                df_keep = df_existing.iloc[0:0]  # re-running everything — start fresh
+                df_keep = df_existing.iloc[0:0]
             rows = df_keep.to_dict("records")
             print(f"[CACHE] Pre-loaded {len(rows)} rows from {ckpt_path} "
                   f"(keeping methods not in --run_methods)", flush=True)
@@ -1981,7 +1855,7 @@ def main() -> None:
             dist_penalty=float(args.dist_penalty),
         )
 
-        # action bounds for unsafe planner
+        # Action bounds for the ungated planner.
         low = np.asarray(env_real.action_space.low, dtype=np.float32).ravel()
         high = np.asarray(env_real.action_space.high, dtype=np.float32).ravel()
 
@@ -1994,7 +1868,7 @@ def main() -> None:
 
         calib_traj_ids_global = choose_calib_traj_ids(int(seed), int(max_ds), float(args.calib_frac))
 
-        # ---- PPO baseline eval ONCE per seed (same env, fixed episode seeds) ----
+        # ── PPO baseline: evaluated once per seed, with the planners' episode seeds ──
         planner_eval_seed = int(seed + 10_000)
         ppo_capture_eps = set(range(int(args.traj_eval_episodes)))
 
@@ -2010,7 +1884,7 @@ def main() -> None:
         )
         print(f"[DONE] ppo_only | {ppo_mm}", flush=True)
 
-        # Save PPO trajectories once per seed, then reuse for all selected ds plots
+        # PPO trajectories are saved once per seed and reused in every ds plot.
         ppo_traj_list = []
         for ei, traj in ppo_trajs.items():
             npz_path = os.path.join(
@@ -2025,7 +1899,7 @@ def main() -> None:
         for ds in ds_list:
             print(f"\n[DATASET] ds={ds} (REGENERATE via traj_seeds[:ds])", flush=True)
 
-            # Load per-(ds,seed) partial checkpoint
+            # Methods already completed in this output directory.
             _outdir = str(args.outdir)
             _completed_methods = _pm_load_completed_methods(_outdir)
             if _completed_methods:
@@ -2040,7 +1914,7 @@ def main() -> None:
                 traj_plot_store[(int(seed), int(ds))]["ppo_only"] = ppo_traj_list
 
             if int(args.load_from_cache) == 0:
-                # ── Normal path: collect data, train ensemble, calibrate ──────────
+                # ── Collect data, train the ensemble, fit the calibrators ──
                 data = collect_dataset_from_traj_seeds(
                     env=env_real,
                     ppo=ppo,
@@ -2054,7 +1928,6 @@ def main() -> None:
                     ds=int(ds),
                 )
 
-                # SAVING dataset
                 save_dataset_cache(
                     args.outdir, seed, ds, data, train, calib,
                     traj_seeds_used=traj_seeds[: int(ds)],
@@ -2067,7 +1940,6 @@ def main() -> None:
                 ens = build_ensemble(obs_dim, act_dim)
                 fit_ensemble(ens, train)
 
-                # SAVING ensemble
                 save_ensemble_cache(
                     args.outdir, seed, ds, ens,
                     obs_dim=obs_dim,
@@ -2124,7 +1996,7 @@ def main() -> None:
                 save_calibrator_cache(args.outdir, seed, ds, name="epistemic", calibrator=cal_var, eps=float(eps_var_emp))
 
             else:
-                # ── Cache path: load pre-computed structures ───────────────────────
+                # ── Load dataset, ensemble and calibrators from the cache ──
                 print(f"[CACHE] Loading from cache: seed={seed} ds={ds}", flush=True)
                 train, calib = load_dataset_cache(args.outdir, seed, ds)
 
@@ -2170,7 +2042,7 @@ def main() -> None:
                 c_puct=float(args.c_puct),
             )
 
-            # --- PPO baseline row replicated across ds (flat line by construction) ---
+            # PPO row, identical for every ds (the baseline does not use the dataset).
             _ppo_row = {
                 "seed": int(seed),
                 "dataset_trajs": int(ds),
@@ -2191,10 +2063,6 @@ def main() -> None:
             if "ppo_only" not in _completed_methods:
                 _pm_save_partial_result(_outdir, _ppo_row)
 
-            # ------------------------------------------------------------------
-            # Debug helper: runs LoggingMCTS for a few episodes and saves plots
-            # Controlled by --debug_episodes, --debug_ds, --debug_methods, etc.
-            # ------------------------------------------------------------------
             def run_debug_method(
                 method: str,
                 cfg: OfflineMCTSConfig,
@@ -2202,6 +2070,7 @@ def main() -> None:
                 use_gate: bool,
                 use_ppo: bool,
             ):
+                """Run LoggingMCTS for --debug_episodes episodes and save debug plots."""
                 if not _DEBUG_VIZ_AVAILABLE:
                     return
                 if int(args.debug_episodes) <= 0:
@@ -2229,7 +2098,7 @@ def main() -> None:
                     log_sims=bool(int(args.debug_log_sims)),
                 )
 
-                # Use the same eval seed as the main eval loop, one per episode
+                # Same episode seeds as the main evaluation.
                 base_ep_seed = int(planner_eval_seed)
 
                 for ep_idx in range(int(args.debug_episodes)):
@@ -2250,7 +2119,7 @@ def main() -> None:
                         )
                         continue
 
-                    # Retrieve the goal position for this episode seed
+                    # Goal position for this episode seed.
                     goal_pos = None
                     try:
                         obs_tmp, _ = env_real.reset(seed=ep_seed)
@@ -2260,11 +2129,11 @@ def main() -> None:
                     except Exception:
                         pass
 
-                    # Which real steps to include in Plot 2
+                    # Real-env steps that get a simulation plot.
                     if args.debug_sim_steps is not None:
                         sim_steps = [int(t) for t in args.debug_sim_steps]
                     else:
-                        sim_steps = list(range(0, len(logs), 5))  # every 5 steps by default
+                        sim_steps = list(range(0, len(logs), 5))
 
                     out_ep_dir = os.path.join(
                         args.outdir, "debug", method,
@@ -2277,7 +2146,7 @@ def main() -> None:
                         out_dir=out_ep_dir,
                         steps_for_sim_plots=sim_steps,
                         goal_pos=goal_pos,
-                        # PointMazeMedium default limits — adjust if your maze differs
+                        # Plot limits of the maze area.
                         maze_xlim=(-3.5, 3.5),
                         maze_ylim=(-3.5, 3.5),
                         show_detail_step=(
@@ -2288,13 +2157,20 @@ def main() -> None:
                     print(f"[DEBUG VIZ] {method} ep{ep_idx} plots -> {out_ep_dir}/", flush=True)
 
             def run_method(method: str, cfg: OfflineMCTSConfig, calibrator: Optional[Any], use_gate: bool, use_ppo: bool):
+                """Build the PPO-anchored MCTS-DPW planner, evaluate it and record the row."""
                 if method in _completed_methods:
                     print(f"[CKPT] {method} already done — loading from checkpoint", flush=True)
                     rows.append(_completed_methods[method])
                     return
 
                 ckpt_m = _PMEpisodeCheckpoint(_outdir, method)
-                planner = OfflineMCTS_DPW_PPO_SPIBB_Parametric(
+                planner_cls = OfflineMCTS_DPW_PPO_SPIBB_Parametric
+                if str(args.mcts_backend) == "array":
+                    from safe_rl.algorithms.offline.cal_spi.mcts_array_pointmaze import (
+                        OfflineMCTS_DPW_PPO_Array_PointMaze,
+                    )
+                    planner_cls = OfflineMCTS_DPW_PPO_Array_PointMaze
+                planner = planner_cls(
                     model_env=model_env,
                     ppo_policy=ppo,
                     cfg=cfg,
@@ -2365,6 +2241,7 @@ def main() -> None:
                     traj_plot_store[(int(seed), int(ds))][method] = method_traj_list
 
             def run_unsafe_model_only(method: str, cfg: OfflineMCTSConfig):
+                """Evaluate ungated MCTS-DPW on the ensemble (no PPO prior, value or fallback)."""
                 if method in _completed_methods:
                     print(f"[CKPT] {method} already done — loading from checkpoint", flush=True)
                     rows.append(_completed_methods[method])
@@ -2468,7 +2345,6 @@ def main() -> None:
                 _pm_save_partial_result(_outdir, _row)
                 print(f"[DONE] {method} | {mm}", flush=True)
 
-            # Helper: returns True if this method should be run
             _active_methods = set(args.run_methods) if args.run_methods else None
             def _should_run(method: str) -> bool:
                 return _active_methods is None or method in _active_methods
@@ -2500,7 +2376,7 @@ def main() -> None:
                 run_method("morel_usad", cfg_morel, calibrator=None, use_gate=True, use_ppo=True)
                 run_debug_method("morel_usad", cfg_morel, calibrator=None, use_gate=True, use_ppo=True)
 
-            # 4) UNSAFE pure model-only MCTS (no PPO, no gate)
+            # 4) mcts_only_no_gate: model-only MCTS-DPW (no PPO, no gate)
             cfg_unsafe = OfflineMCTSConfig(**vars(base_cfg))
             if _should_run("mcts_only_no_gate"):
                 run_unsafe_model_only("mcts_only_no_gate", cfg_unsafe)
@@ -2519,16 +2395,9 @@ def main() -> None:
                 methods_cfg=methods_cfg,
             )
 
-            # ── Offline RL Baselines ───────────────────────────────────────────
-            # Baselines train on the FULL dataset (D_train ∪ D_calib).
-            # The train/calib split is an internal Cal-SPI detail for gate
-            # calibration; IQL/TD3+BC/MOReL/MOPO have no calibration step,
-            # so they should use all ds trajectories — consistent with how
-            # these methods are evaluated in D4RL/original papers.
-            # Note: for small ds (e.g. ds=1), D_train may be empty because
-            # trajectory 0 was globally pre-assigned to calibration; using
-            # the full dataset avoids the degenerate empty-train edge case.
-            # ──────────────────────────────────────────────────────────────────
+            # ── Offline RL baselines ──
+            # Baselines have no calibration step and train on D_train ∪ D_cal.
+            # For small ds, D_train can be empty (all trajectories assigned to D_cal).
             data_for_baselines = {
                 k: np.concatenate([train[k], calib[k]], axis=0)
                 for k in train.keys()
@@ -2540,8 +2409,8 @@ def main() -> None:
             rb        = min(int(args.baseline_rollout_batch), len(data_for_baselines["act"]))
 
             # 5) IQL
-            # PointMaze is a navigation task with sparse reward → AntMaze-style hyperparameters
-            # (Kostrikov 2021 Table 5: alpha=0.9, beta=10.0 for AntMaze vs 0.7/3.0 for locomotion)
+            # Navigation-task hyperparameters of Kostrikov et al. (2021): expectile 0.9,
+            # temperature 10.0 (AntMaze setting; locomotion uses 0.7 / 3.0).
             if _should_run("iql"):
                 iql_agent = IQLAgent(
                     obs_dim=state_dim, act_dim=act_dim,
@@ -2556,7 +2425,7 @@ def main() -> None:
                         _pm_save_baseline_model(_outdir, "iql", iql_agent)
                 run_baseline("iql", iql_agent)
 
-            # 6) TD3+BC — same hyperparameters across all domains (Fujimoto & Gu 2021 Table 1)
+            # 6) TD3+BC, default hyperparameters of Fujimoto & Gu (2021) in every domain.
             if _should_run("td3bc"):
                 td3_agent = TD3BCAgent(
                     obs_dim=state_dim, act_dim=act_dim,
@@ -2571,8 +2440,8 @@ def main() -> None:
                         _pm_save_baseline_model(_outdir, "td3bc", td3_agent)
                 run_baseline("td3bc", td3_agent)
 
-            # 7) MOReL-full (reuses pre-trained MSE ensemble — no re-training)
-            # tau_percentile=95: data-driven threshold (MOReL paper: heuristic on D_train USAD)
+            # 7) MOReL-full on the trained MSE ensemble; tau = 95th percentile of USAD on the
+            # training data.
             if _should_run("morel_full"):
                 morel_agent = MORelFullAgent(
                     ensemble=ens, obs_dim=state_dim, act_dim=act_dim,
@@ -2669,7 +2538,7 @@ def main() -> None:
 
         env_real.close()
 
-    # ---- save ----
+    # ── Save results ──
     rows_sane = [{k: _sanitize_for_df(v) for k, v in r.items()} for r in rows]
     df_partial = pd.DataFrame.from_records(rows_sane)
     save_checkpoint(df_partial, args.outdir)
@@ -2677,7 +2546,7 @@ def main() -> None:
     df_partial.to_csv(out_csv, index=False)
     print(f"\n[SAVED] {out_csv}", flush=True)
 
-    # ---- plots ----
+    # ── Plots ──
     plot_metric(
         df_partial,
         "dataset_trajs",
@@ -2706,44 +2575,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-# OUT=results_pointmaze_speeddist_trajs
-
-# for DS in 10 100 1000; do
-# python scripts/offline/pointmaze/benchmark_pointmaze_gates_full.py \
-#   --outdir "${OUT}/ds${DS}/seed0" \
-#   --train_ppo_script scripts/offline/pointmaze/train_ppo_pointmaze_suboptimal.py \
-#   --ppo_train_once 1 \
-#   --ppo_global_path models/ppo_global_pointmaze_speeddist_40k.zip \
-#   --ppo_train_seed 0 \
-#   --ppo_timesteps 40000 \
-#   --reward_type dense \
-#   --reward_mode speed_distance \
-#   --step_penalty 1.0 \
-#   --dist_penalty 0.2 \
-#   --success_bonus 1500.0 \
-#   --living_cost 0.0 \
-#   --continuing_task 0 \
-#   --dataset_trajs "${DS}" \
-#   --seeds 0 \
-#   --num_sims 100 \
-#   --max_depth 10 \
-#   --gamma 0.99 \
-#   --calib_frac 0.2 \
-#   --calib_bins 30 \
-#   --calib_delta 0.05 \
-#   --calib_min_samples 50 \
-#   --eps_from_calibration 1 \
-#   --eps_quantile 0.95 \
-#   --tau 0.2 \
-#   --eval_episodes 40 \
-#   --max_steps 300 \
-#   --save_trajs_for_ds 10 100 1000 \
-#   --traj_eval_episodes 1 \
-#   --plot_trajs 1
-# done
-
-
-
-

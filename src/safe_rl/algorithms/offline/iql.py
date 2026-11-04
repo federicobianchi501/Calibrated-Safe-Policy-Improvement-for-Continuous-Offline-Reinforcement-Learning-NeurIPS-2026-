@@ -1,22 +1,18 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-"""
-iql.py — Implicit Q-Learning (Kostrikov et al., 2021)
-arXiv:2110.06169
+"""Implicit Q-Learning (Kostrikov et al., ICLR 2022, arXiv:2110.06169).
 
-Offline RL algorithm using:
-  - Expectile regression for V-network
-  - Advantage-weighted regression for actor
-  - Standard TD backup for Q-network
+Expectile regression for V, TD backup for the double-Q network, and
+advantage-weighted regression for a deterministic tanh actor.
 
-Interface:
-  agent = IQLAgent(obs_dim, act_dim, cfg)
-  agent.train(dataset, n_epochs=100)
-  action = agent.act(obs_dict)          # obs_dict: {"observation":..., "desired_goal":...}
+    agent = IQLAgent(obs_dim, act_dim, cfg)
+    agent.train(dataset, n_epochs=100)
+    action = agent.act(obs)   # dict {"observation", "desired_goal"} or flat array
 
-Goal-conditioned: state = concat(observation, desired_goal).
+For dict observations the state is concat(observation, desired_goal).
 """
 
 from __future__ import annotations
@@ -37,7 +33,8 @@ import torch.optim as optim
 
 @dataclass
 class IQLConfig:
-    # Architecture (paper Table 5: 3 hidden layers for locomotion)
+    """IQL hyperparameters (defaults follow the IQL locomotion settings)."""
+
     hidden_dim: int   = 256
     n_hidden:   int   = 3
 
@@ -45,14 +42,13 @@ class IQLConfig:
     lr:         float = 3e-4
     batch_size: int   = 256
     gamma:      float = 0.99
-    tau:        float = 0.005   # soft target update coefficient
+    tau:        float = 0.005   # Polyak coefficient for the target Q network
 
-    # IQL-specific
+    # IQL
     beta:       float = 3.0     # inverse temperature for advantage weighting
     alpha:      float = 0.7     # expectile level for V (0.5 = MSE, 1 = max)
-    clip_score: float = 100.0   # clip exp(beta*A) to avoid numerical issues
+    clip_score: float = 100.0   # upper clip on exp(beta * A)
 
-    # State normalization (paper Table 5: normalize_states=True for locomotion)
     normalize_states: bool  = True
 
     device: str = "cpu"
@@ -85,11 +81,13 @@ class DoubleQNetwork(nn.Module):
         return self.q1(sa).squeeze(-1), self.q2(sa).squeeze(-1)
 
     def min(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """Elementwise min of the two Q heads."""
         q1, q2 = self.forward(s, a)
         return torch.min(q1, q2)
 
 
 class VNetwork(nn.Module):
+    """State-value network V(s)."""
     def __init__(self, state_dim: int, hidden_dim: int, n_hidden: int):
         super().__init__()
         self.net = _mlp(state_dim, 1, hidden_dim, n_hidden)
@@ -113,11 +111,10 @@ class DeterministicActor(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class IQLAgent:
-    """
-    Implicit Q-Learning agent for continuous-action offline RL.
+    """IQL agent for continuous-action offline RL.
 
-    Observation interface: dict with keys "observation" and "desired_goal"
-    (PointMaze goal-conditioned format). Uses s = concat(obs, goal).
+    Accepts dict observations with "observation" and "desired_goal" (state is
+    their concatenation) or flat arrays.
     """
 
     def __init__(
@@ -132,7 +129,7 @@ class IQLAgent:
         self.device = torch.device(self.cfg.device)
 
         torch.manual_seed(self.cfg.seed)
-        state_dim = obs_dim  # after _obs_to_state (flat obs + goal concatenated)
+        state_dim = obs_dim  # rebuilt in train() if obs + goal is wider
 
         self.q_net  = DoubleQNetwork(state_dim, act_dim,
                                      self.cfg.hidden_dim, self.cfg.n_hidden).to(self.device)
@@ -142,26 +139,21 @@ class IQLAgent:
         self.actor  = DeterministicActor(state_dim, act_dim,
                                          self.cfg.hidden_dim, self.cfg.n_hidden).to(self.device)
 
-        # hard copy Q -> Q_target
         self.q_tgt.load_state_dict(self.q_net.state_dict())
 
         self.q_opt  = optim.Adam(self.q_net.parameters(),  lr=self.cfg.lr)
         self.v_opt  = optim.Adam(self.v_net.parameters(),  lr=self.cfg.lr)
         self.a_opt  = optim.Adam(self.actor.parameters(),  lr=self.cfg.lr)
 
-        # training history
         self.loss_history: Dict[str, list] = {"q": [], "v": [], "actor": []}
 
-        # state normalization stats (set during train())
+        # Set in train() when cfg.normalize_states is True.
         self.state_mean: Optional[torch.Tensor] = None
         self.state_std:  Optional[torch.Tensor] = None
 
     # ── observation processing ────────────────────────────────────────────────
     def _obs_to_state(self, obs: Any) -> np.ndarray:
-        """
-        Convert observation (dict or flat array) to flat numpy state vector.
-        For PointMaze: concat(observation, desired_goal).
-        """
+        """Flatten an observation; dicts become concat(observation, desired_goal)."""
         if isinstance(obs, dict):
             o = np.asarray(obs["observation"], dtype=np.float32).reshape(-1)
             g = np.asarray(obs.get("desired_goal", np.zeros(2)), dtype=np.float32).reshape(-1)
@@ -171,12 +163,10 @@ class IQLAgent:
     def _dataset_to_tensors(
         self, dataset: Dict[str, Any]
     ) -> Tuple[torch.Tensor, ...]:
-        """
-        Parse dataset dict (as produced by transitions_*.npz) to torch tensors.
+        """Convert a transition dict to tensors (S, A, R, S2, D).
 
-        Expected keys (PointMaze):
-          obs_observation, obs_desired_goal, act, rew, done,
-          next_observation, next_desired_goal
+        Keys: obs_observation, act, rew, done, next_observation, and optionally
+        obs_desired_goal / next_desired_goal (zeros of width 2 if absent).
         """
         def _t(x): return torch.as_tensor(np.asarray(x, dtype=np.float32),
                                            device=self.device)
@@ -210,10 +200,9 @@ class IQLAgent:
             pt.data.copy_(tau * p.data + (1.0 - tau) * pt.data)
 
     def train(self, dataset: Dict[str, Any], n_epochs: int = 100) -> None:
-        """
-        Train IQL on the offline dataset.
+        """Train on an offline transition dict (keys as in _dataset_to_tensors).
 
-        dataset: dict with keys as in transitions_*.npz
+        Each epoch is a single gradient step on one minibatch for Q, V and actor.
         """
         S, A, R, S2, D = self._dataset_to_tensors(dataset)
         N = S.shape[0]
@@ -222,13 +211,11 @@ class IQLAgent:
             return
         bs = min(self.cfg.batch_size, N)
 
-        # Update obs_dim to actual state_dim (obs + goal)
         state_dim = int(S.shape[1])
         if state_dim != self.obs_dim:
             self._rebuild_networks(state_dim)
             S, A, R, S2, D = self._dataset_to_tensors(dataset)
 
-        # State normalization (Kostrikov 2021, Table 5: normalize_states=True)
         if self.cfg.normalize_states:
             self.state_mean = S.mean(0, keepdim=True)
             self.state_std  = S.std(0, keepdim=True).clamp(min=1e-3)
@@ -249,14 +236,14 @@ class IQLAgent:
                 v2 = self.v_net(s2)
                 q_target = r + self.cfg.gamma * (1.0 - d) * v2
 
-            # ── Q update ──
+            # Q: TD target uses V(s'), not a max over actions.
             q1, q2 = self.q_net(s, a)
             q_loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
             self.q_opt.zero_grad()
             q_loss.backward()
             self.q_opt.step()
 
-            # ── V update (expectile regression) ──
+            # V: expectile regression onto min target Q.
             with torch.no_grad():
                 q_min = self.q_tgt.min(s, a)
             v     = self.v_net(s)
@@ -266,8 +253,7 @@ class IQLAgent:
             v_loss.backward()
             self.v_opt.step()
 
-            # ── Actor update (advantage-weighted regression) ──
-            # w = exp(β·A).clip(max=C), no mean-normalization (Kostrikov 2021 Algorithm 1)
+            # Actor: AWR with w = min(exp(beta * A), clip_score), no weight normalization.
             with torch.no_grad():
                 adv  = self.q_tgt.min(s, a) - self.v_net(s)
                 w    = torch.exp(self.cfg.beta * adv).clamp(max=self.cfg.clip_score)
@@ -284,7 +270,7 @@ class IQLAgent:
             self.loss_history["actor"].append(float(a_loss))
 
     def _rebuild_networks(self, state_dim: int) -> None:
-        """Re-initialise networks with the correct state_dim."""
+        """Re-create networks and optimizers for a new state_dim."""
         self.obs_dim = state_dim
         self.q_net  = DoubleQNetwork(state_dim, self.act_dim,
                                      self.cfg.hidden_dim, self.cfg.n_hidden).to(self.device)
@@ -301,7 +287,7 @@ class IQLAgent:
     # ── inference ─────────────────────────────────────────────────────────────
     @torch.no_grad()
     def act(self, obs: Any) -> np.ndarray:
-        """Return action ∈ [-1,1]^act_dim from observation dict or array."""
+        """Return the deterministic action in [-1, 1]^act_dim."""
         s = torch.as_tensor(self._obs_to_state(obs), dtype=torch.float32,
                             device=self.device).unsqueeze(0)
         if self.state_mean is not None:
@@ -310,4 +296,5 @@ class IQLAgent:
         return np.clip(a, -1.0, 1.0).astype(np.float32)
 
     def __call__(self, obs: Any) -> np.ndarray:
+        """Alias for act()."""
         return self.act(obs)

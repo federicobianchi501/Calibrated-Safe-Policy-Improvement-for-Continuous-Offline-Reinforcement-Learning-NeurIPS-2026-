@@ -1,7 +1,9 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
+"""Cloneable PointMaze wrapper with configurable reward modes."""
 import copy
 from typing import Any, Dict, Optional, Tuple
 
@@ -11,6 +13,7 @@ from gymnasium import Wrapper
 
 
 def _find_timelimit_wrapper(env) -> Optional[Any]:
+    """Return the first wrapper in the chain that holds a TimeLimit step counter, or None."""
     cur = env
     while cur is not None:
         if hasattr(cur, "_elapsed_steps"):
@@ -20,6 +23,7 @@ def _find_timelimit_wrapper(env) -> Optional[Any]:
 
 
 def _get_goal_obj(unwrapped) -> Tuple[Optional[Any], Optional[str]]:
+    """Return a copy of the env goal and the attribute name it was read from."""
     for name in ("goal", "_goal", "desired_goal", "_desired_goal", "target_goal", "_target_goal"):
         if hasattr(unwrapped, name):
             try:
@@ -30,6 +34,7 @@ def _get_goal_obj(unwrapped) -> Tuple[Optional[Any], Optional[str]]:
 
 
 def _set_goal_obj(unwrapped, goal_value: Any, goal_attr: Optional[str]) -> None:
+    """Write a goal previously read by `_get_goal_obj` back to the env."""
     if goal_attr is None:
         return
     if hasattr(unwrapped, goal_attr):
@@ -40,20 +45,18 @@ def _set_goal_obj(unwrapped, goal_value: Any, goal_attr: Optional[str]) -> None:
 
 
 class CloneablePointMazeWrapper(Wrapper):
-    """
-    Fully cloneable MuJoCo wrapper for PointMaze.
+    """Cloneable PointMaze wrapper.
 
-    - Full MuJoCo physics cloning
-    - RNG cloning
-    - TimeLimit counter cloning
-    - Goal cloning (important for continuing_task!)
+    `clone_state` / `restore_state` cover the full MuJoCo physics state, the env RNG, the
+    TimeLimit counter and the goal (which changes over time when continuing_task=True).
 
-    FIXED: Removed wall_penalty (compared to the broken new version).
-    wall_penalty was removed because:
-    1. The model env has no wall_penalty in its reward -> reward mismatch if != 0
-    2. The ensemble learns from data collected with this env's reward, so any 
-       wall_penalty here would need to be mirrored in the model env (which is hard)
-    3. wall_penalty=0.0 was the only value used in all experiments anyway
+    Reward modes:
+        current:         env reward, plus `success_bonus` on successful termination,
+                         minus `living_cost` per step.
+        speed:           -step_penalty per step, plus `success_bonus` on success.
+        speed_distance:  -step_penalty - dist_penalty * ||achieved_goal - desired_goal||,
+                         plus `success_bonus` on success.
+    The reward contains only terms that the model environment can reproduce.
     """
 
     def __init__(
@@ -84,6 +87,7 @@ class CloneablePointMazeWrapper(Wrapper):
         self.dist_penalty  = float(dist_penalty)
 
     def clone_state(self) -> Dict[str, Any]:
+        """Return a snapshot of physics, step counter, RNG and goal state."""
         mj_state = np.zeros(self._state_size, dtype=np.float64)
         mujoco.mj_getState(self.model, self.data, mj_state, self._state_spec)
 
@@ -107,6 +111,7 @@ class CloneablePointMazeWrapper(Wrapper):
         }
 
     def restore_state(self, snapshot: Dict[str, Any]) -> None:
+        """Restore a snapshot produced by `clone_state`."""
         mujoco.mj_setState(self.model, self.data, snapshot["mj_state"], self._state_spec)
         mujoco.mj_forward(self.model, self.data)
 
@@ -125,6 +130,7 @@ class CloneablePointMazeWrapper(Wrapper):
         )
 
     def step(self, action):
+        """Step the env and replace the reward according to `reward_mode`."""
         obs, reward, terminated, truncated, info = self.env.step(action)
 
         if not isinstance(info, dict):

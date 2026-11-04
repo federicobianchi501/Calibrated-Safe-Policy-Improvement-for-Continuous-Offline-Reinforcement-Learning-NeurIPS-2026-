@@ -1,7 +1,9 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
+"""Append-only CSV/JSONL loggers and a JSON writer for experiment results."""
 from __future__ import annotations
 import csv
 import json
@@ -17,10 +19,10 @@ def _to_plain(x: Any) -> Any:
 
 
 class CSVLogger:
-    """
-    Append-only CSV logger with stable columns.
-    - If file does not exist -> write header.
-    - Unknown columns are allowed if you pass a superset of keys; we keep a fixed schema per file.
+    """Append-only CSV logger with a fixed column schema.
+
+    The header is written when the file is created. Keys of a logged row that are not in
+    `fieldnames` are ignored; missing keys are written as empty strings.
     """
     def __init__(self, path: str, fieldnames: Iterable[str]):
         self.path = path
@@ -32,6 +34,7 @@ class CSVLogger:
                 w.writeheader()
 
     def log(self, row: Dict[str, Any]) -> None:
+        """Append one row."""
         out = {k: row.get(k, "") for k in self.fieldnames}
         with open(self.path, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=self.fieldnames)
@@ -39,6 +42,8 @@ class CSVLogger:
 
 
 class JSONLLogger:
+    """Append-only JSON Lines logger; dataclasses are converted to dicts."""
+
     def __init__(self, path: str):
         self.path = path
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -47,12 +52,14 @@ class JSONLLogger:
                 f.write("")
 
     def log(self, obj: Dict[str, Any]) -> None:
+        """Append one JSON record."""
         payload = _to_plain(obj)
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload) + "\n")
 
 
 def save_json(path: str, payload: Dict[str, Any]) -> None:
+    """Write `payload` (dict or dataclass) to `path` as indented JSON."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     out = _to_plain(payload)
     with open(path, "w", encoding="utf-8") as f:

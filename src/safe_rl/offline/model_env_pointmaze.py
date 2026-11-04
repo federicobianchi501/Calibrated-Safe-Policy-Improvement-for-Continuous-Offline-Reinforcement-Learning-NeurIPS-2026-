@@ -1,17 +1,15 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-# src/safe_rl/offline/model_env_pointmaze.py  [FIXED — no wall_penalty]
-#
-# BUG FIX: Removed wall_penalty from ModelEnvConfig.
-# REASON: The ensemble is trained on dataset transitions WITHOUT wall_penalty
-# (wall_penalty was only in the real env and defaults to 0.0). Having wall_penalty
-# in ModelEnvConfig but not applying it in step() creates a dead-code config field.
-# More importantly, if wall_penalty != 0 in real env but not in model env,
-# the reward function is inconsistent: ensemble learns reward without wall_penalty
-# but the gate/planner expects reward with wall_penalty.
-# Safest fix: remove it entirely and keep model env reward matched to dataset reward.
+"""Learned-model environment for PointMaze dict observations.
+
+Next observations come from the dynamics ensemble; achieved_goal is set to the first
+entries (x, y) of the predicted observation, and the reward and termination are computed
+analytically from the distance to desired_goal, using the same reward modes as the
+real environment.
+"""
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -23,6 +21,7 @@ from safe_rl.offline.ensemble_dynamics_sb3 import EnsembleDynamicsSB3
 
 @dataclass
 class ModelEnvConfig:
+    """Reward, termination and clipping settings of ModelPointMazeEnv."""
     continuing_task: bool = False
     reward_type: str = "sparse"
     goal_thresh: float = 0.45
@@ -38,16 +37,11 @@ class ModelEnvConfig:
 
 
 class ModelPointMazeEnv:
-    """
-    Learned model env for Gymnasium-Robotics PointMaze dict observations.
+    """Learned-model environment for Gymnasium-Robotics PointMaze dict observations.
 
-    IMPORTANT:
-      In PointMaze, achieved_goal is the (x,y) position.
-      We MUST update achieved_goal from the predicted observation vector,
-      otherwise distance-to-goal never changes in planning.
-
-    NOTE ON TIME LIMIT:
-      Set truncate_on_time_limit=False for MCTS (tree depth = planning horizon).
+    achieved_goal is the (x, y) position and is refreshed from the predicted observation
+    at every step, so the distance to the goal evolves during planning. For MCTS use
+    truncate_on_time_limit=False; the tree depth is then the planning horizon.
     """
 
     def __init__(
@@ -68,6 +62,7 @@ class ModelPointMazeEnv:
         return float(np.linalg.norm(ag - dg))
 
     def reset_counter(self) -> None:
+        """Reset the step counter used for time-limit truncation."""
         self._t = 0
 
     def _reward_and_done(self, obs_next: Dict[str, np.ndarray]) -> Tuple[float, bool]:
@@ -137,7 +132,7 @@ class ModelPointMazeEnv:
         return fn(obs, action)
 
     def _predict_next(self, obs, action, model_index, rng):
-        # Path 1: dict-level predictor (preferred)
+        # Dict-level predictor.
         out = self._call_predict_next_obs_dict(obs, action, model_index, rng)
         if out is not None:
             out = {
@@ -147,7 +142,7 @@ class ModelPointMazeEnv:
             }
             return self._postprocess_pointmaze_goals(out)
 
-        # Path 2: vector mean predictor
+        # Ensemble-mean vector predictor.
         fn = getattr(self.ens, "predict_next_obs_vec_mean", None)
         if fn is not None:
             next_obs_vec = np.asarray(fn(obs, action), dtype=np.float32).ravel()
@@ -158,7 +153,7 @@ class ModelPointMazeEnv:
             }
             return self._postprocess_pointmaze_goals(out)
 
-        # Path 3: fallback via _predict_all
+        # Ensemble mean from the raw per-member deltas.
         if hasattr(self.ens, "_predict_all"):
             mus = self.ens._predict_all(obs, action)   # [E, obs_dim]
             mean_delta = mus.mean(axis=0).astype(np.float32)
@@ -180,6 +175,15 @@ class ModelPointMazeEnv:
         model_index: Optional[int] = None,
         rng: Optional[np.random.Generator] = None,
     ):
+        """Advance one model step.
+
+        The action is clipped to [-1, 1]. model_index selects the ensemble member
+        (see EnsembleDynamicsSB3.sample_next_obs_vec). Non-finite predictions end the
+        episode with reward 0 when cfg.terminate_on_nan is set.
+
+        Returns:
+            (obs_next, reward, terminated, truncated, info) with info["success"].
+        """
         if rng is None:
             rng = np.random.default_rng()
 

@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
 """
-benchmark_continuous.py — Cal-SPI benchmark for Walker2d and Hopper.
+Cal-SPI benchmark on the MuJoCo locomotion domains (Hopper, HalfCheetah, Walker2d, Ant).
 
-Mirrors benchmark_pointmaze_gates_full_debug.py but for flat-obs locomotion envs.
+One run covers a (domain, dataset size, seed) cell: dataset collection with the PPO
+baseline, trajectory-level train/calibration split, ensemble training, calibrator
+fitting, planner construction (backends original, batched, numba, numba_scaled, array),
+offline RL baselines, and episodic evaluation with per-episode checkpoints.
 
-Key differences from PointMaze:
-  - Observations are flat numpy arrays (no dict / goal structure)
-  - Ensemble receives obs wrapped as {"observation": obs_flat} internally
-  - MCTS planner uses ModelContinuousEnv + EnsembleFlatWrapper
-  - Success criterion: episode not terminated early (agent survived)
-  - No 2D maze visualization (locomotion is 1D in x_position)
-  - PPO uses MlpPolicy (not MultiInputPolicy)
+Observations are flat arrays; the ensemble sees them as {"observation": obs}. An episode
+counts as a success when it is not terminated early.
 
-Methods supported:
-  ppo_only, mcts_only_no_gate, calibrated_usad, calibrated_variance, iql, td3bc, morel_full, mopo_mse, cql, bear, cal_ql
+Methods: ppo_only, mcts_only_no_gate, calibrated_usad, calibrated_variance, iql, td3bc,
+morel_full, mopo_mse, cql, bear, cal_ql.
 """
 from __future__ import annotations
 
@@ -37,19 +36,15 @@ import pandas as pd
 import torch
 from stable_baselines3 import PPO
 
-# Ensure src is on path when run directly
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "src"))
 
 from safe_rl.envs.continuous_env_factory import DOMAIN_CONFIGS, make_continuous_env
 from safe_rl.offline.ensemble_dynamics_sb3 import EnsembleDynamicsSB3, EnsembleTrainConfig
 from safe_rl.offline.model_env_continuous import ModelContinuousEnv, ModelContinuousEnvConfig
-from safe_rl.offline.model_env_reacher import ModelReacherEnv
 
 
 def _make_model_env(ens, model_cfg: ModelContinuousEnvConfig):
-    """Dispatch to the Reacher-specialized model env when domain == 'reacher'."""
-    if str(model_cfg.domain).lower() == "reacher":
-        return ModelReacherEnv(ens, model_cfg)
+    """Build the learned-dynamics environment used by the planners."""
     return ModelContinuousEnv(ens, model_cfg)
 from safe_rl.offline.uncertainty_calibration import (
     UncertaintyCalibrator,
@@ -75,34 +70,34 @@ from safe_rl.algorithms.offline.cal_ql import CalQLAgent, CalQLConfig
 # ---------------------------------------------------------------------------
 # Domain-specific baseline hyperparameters
 # ---------------------------------------------------------------------------
-# Sources:
-#   IQL  — Kostrikov 2021 Table 5 (locomotion: alpha=0.7, beta=3.0, n_hidden=3)
-#   TD3+BC — Fujimoto & Gu 2021 Table 1 (alpha_bc=2.5, n_hidden=2; same across locomotion)
-#   MOReL — Kidambi 2020 (tau = 95th-pct USAD on D_train; kappa=50; rollout_length=5)
-#   MOPO  — Yu 2020 Table 5 (rollout_length: hopper=5, walker2d=1; lam=1.0)
+# Values follow the locomotion settings of the original papers:
+#   IQL    (Kostrikov et al., 2021): alpha=0.7, beta=3.0, 3 hidden layers
+#   TD3+BC (Fujimoto & Gu, 2021):    alpha_bc=2.5, 2 hidden layers
+#   MOReL  (Kidambi et al., 2020):   tau = 95th percentile of USAD on D_train, kappa=50
+#   MOPO   (Yu et al., 2020):        rollout_length 5 (1 on walker2d), lam=1.0
 
 def make_iql_cfg(domain: str, seed: int) -> IQLConfig:
-    """IQL config per-domain. Locomotion uses paper Table 5 values."""
+    """IQL config with the locomotion hyperparameters."""
     return IQLConfig(
         hidden_dim=256,
-        n_hidden=3,           # paper: 3 hidden layers for locomotion
+        n_hidden=3,
         lr=3e-4,
         batch_size=256,
         gamma=0.99,
         tau=0.005,
-        beta=3.0,             # paper: 3.0 for locomotion (vs 10.0 for maze navigation)
-        alpha=0.7,            # paper: 0.7 for locomotion (vs 0.9 for maze navigation)
+        beta=3.0,             # 10.0 in maze navigation
+        alpha=0.7,            # 0.9 in maze navigation
         clip_score=100.0,
-        normalize_states=True,  # paper: explicitly required for locomotion
+        normalize_states=True,
         seed=seed,
     )
 
 
 def make_td3bc_cfg(domain: str, seed: int) -> TD3BCConfig:
-    """TD3+BC config. Same hyperparameters across all locomotion domains (paper Table 1)."""
+    """TD3+BC config; the same hyperparameters on every locomotion domain."""
     return TD3BCConfig(
         hidden_dim=256,
-        n_hidden=2,           # paper: 2 hidden layers
+        n_hidden=2,
         lr=3e-4,
         batch_size=256,
         gamma=0.99,
@@ -110,22 +105,22 @@ def make_td3bc_cfg(domain: str, seed: int) -> TD3BCConfig:
         policy_noise=0.2,
         noise_clip=0.5,
         policy_freq=2,
-        alpha_bc=2.5,         # paper: 2.5 for all locomotion
-        normalize_states=True,  # paper: explicitly required
+        alpha_bc=2.5,
+        normalize_states=True,
         seed=seed,
     )
 
 
 def make_morel_cfg(domain: str, seed: int, rollout_batch: int) -> MORelFullConfig:
-    """
-    MOReL config per-domain.
-    tau_percentile=95: faithful to original paper (tau = 95th pct of USAD on D_train).
-    kappa=50: HALT reward magnitude — OOD transitions get r=-kappa, done=True (paper Sec. 4.1).
-    rollout_length=5: shorter than original (100-1000) to be compatible with SAC bootstrapping.
+    """MOReL config.
+
+    tau is the 95th percentile of USAD on D_train; transitions above it enter the HALT
+    state with reward -kappa and done=True. rollout_length=5 is shorter than in the
+    original method (100-1000) because the policy is trained with SAC bootstrapping.
     """
     return MORelFullConfig(
-        tau=0.2,              # fallback if USAD computation fails
-        tau_percentile=95.0,  # data-driven tau: faithful to MOReL paper
+        tau=0.2,              # used if the USAD percentile cannot be computed
+        tau_percentile=95.0,
         kappa=50.0,
         rollout_length=5,
         rollout_batch=rollout_batch,
@@ -141,12 +136,8 @@ def make_morel_cfg(domain: str, seed: int, rollout_batch: int) -> MORelFullConfi
 
 
 def make_mopo_mse_cfg(domain: str, seed: int, rollout_batch: int) -> MOPOMSEConfig:
-    """
-    MOPO-MSE config per-domain.
-    rollout_length: paper Table 5 — hopper=5, walker2d=1.
-    lam=1.0: paper default for both domains.
-    """
-    rollout_length = 1 if domain == "walker2d" else 5  # Yu 2020 Table 5
+    """MOPO config on the MSE ensemble; rollout_length 1 on walker2d, 5 elsewhere, lam=1.0."""
+    rollout_length = 1 if domain == "walker2d" else 5
     return MOPOMSEConfig(
         lam=1.0,
         rollout_length=rollout_length,
@@ -163,11 +154,7 @@ def make_mopo_mse_cfg(domain: str, seed: int, rollout_batch: int) -> MOPOMSEConf
 
 
 def make_cql_cfg(domain: str, seed: int) -> CQLConfig:
-    """
-    CQL config per-domain.
-    Sources: Kumar 2020 Table 1 (locomotion) and Table 3 (AntMaze).
-    alpha_cql=5.0, alpha_sac=0.05 (locomotion) — identical for hopper/walker2d.
-    """
+    """CQL config with the locomotion hyperparameters (Kumar et al., 2020)."""
     return CQLConfig(
         hidden_dim=256,
         n_hidden=3,
@@ -175,8 +162,8 @@ def make_cql_cfg(domain: str, seed: int) -> CQLConfig:
         batch_size=256,
         gamma=0.99,
         tau=0.005,
-        alpha_sac=0.05,    # locomotion: Table 1
-        alpha_cql=5.0,     # paper: 5.0 for both locomotion and maze
+        alpha_sac=0.05,
+        alpha_cql=5.0,
         n_action_samples=10,
         normalize_states=True,
         seed=seed,
@@ -184,11 +171,7 @@ def make_cql_cfg(domain: str, seed: int) -> CQLConfig:
 
 
 def make_bear_cfg(domain: str, seed: int) -> BEARConfig:
-    """
-    BEAR config per-domain.
-    Sources: Kumar 2019 Table 1 (locomotion).
-    delta_mmd=0.05, kernel=laplacian bw=20, n_mmd_samples=4, alpha_sac=0.05.
-    """
+    """BEAR config with the locomotion hyperparameters (Kumar et al., 2019)."""
     return BEARConfig(
         hidden_dim=256,
         n_hidden=3,
@@ -199,8 +182,8 @@ def make_bear_cfg(domain: str, seed: int) -> BEARConfig:
         batch_size=256,
         gamma=0.99,
         tau=0.005,
-        alpha_sac=0.05,    # locomotion: Table 1
-        delta_mmd=0.05,    # locomotion: Table 1
+        alpha_sac=0.05,
+        delta_mmd=0.05,
         kernel="laplacian",
         kernel_bw=20.0,
         n_mmd_samples=4,
@@ -211,11 +194,7 @@ def make_bear_cfg(domain: str, seed: int) -> BEARConfig:
 
 
 def make_cal_ql_cfg(domain: str, seed: int) -> CalQLConfig:
-    """
-    Cal-QL config per-domain.
-    Sources: Nakamoto 2023 Table 1 (locomotion).
-    k_mc=5 (locomotion), lambda_cal=1.0, same CQL base as above.
-    """
+    """Cal-QL config (Nakamoto et al., 2023) on top of the CQL settings above."""
     return CalQLConfig(
         hidden_dim=256,
         n_hidden=3,
@@ -223,11 +202,11 @@ def make_cal_ql_cfg(domain: str, seed: int) -> CalQLConfig:
         batch_size=256,
         gamma=0.99,
         tau=0.005,
-        alpha_sac=0.05,    # locomotion: same as CQL
+        alpha_sac=0.05,
         alpha_cql=5.0,
         n_action_samples=10,
         normalize_states=True,
-        k_mc=5,            # locomotion: Nakamoto 2023 Table 1
+        k_mc=5,
         lambda_cal=1.0,
         seed=seed,
     )
@@ -238,14 +217,14 @@ def make_cal_ql_cfg(domain: str, seed: int) -> CalQLConfig:
 # ---------------------------------------------------------------------------
 
 def ensure_dir(p: str) -> None:
+    """Create directory p if it does not exist."""
     os.makedirs(p, exist_ok=True)
 
 
 def make_morel_reward_fn(domain: str):
-    """
-    Return a reward_fn(obs, act, next_obs) -> (rew, done) for model-based rollouts
-    in MOReL-full on flat (non-goal-conditioned) continuous envs.
-    Mirrors the reward formula used in ModelContinuousEnv.
+    """Return a batched reward_fn(obs, act, next_obs) -> (rew, done) for MOReL rollouts.
+
+    Uses the same reward and health check as ModelContinuousEnv.
     """
     dc = DOMAIN_CONFIGS[domain]
     v_idx   = int(dc["vel_obs_idx"])
@@ -270,6 +249,7 @@ def make_morel_reward_fn(domain: str):
 
 
 def _jsonable(x):
+    """Convert dataclasses and numpy values to JSON-serializable objects."""
     if is_dataclass(x):
         return asdict(x)
     if isinstance(x, (np.integer, np.floating)):
@@ -282,6 +262,7 @@ def _jsonable(x):
 
 
 def sha256_file(path: str) -> str:
+    """Return the SHA-256 hex digest of a file."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
@@ -292,30 +273,26 @@ def sha256_file(path: str) -> str:
 # ---------------------------------------------------------------------------
 # Checkpoint utilities
 # ---------------------------------------------------------------------------
-# Design:
-#   ep_ckpt/<method>.jsonl  — one line per completed episode (append-only)
-#   results_partial.jsonl   — one line per completed method (append-only)
-#   models/<method>.pt      — trained baseline model weights
+# Layout inside the output directory:
+#   ep_ckpt/<method>.jsonl  one line per completed episode (append-only)
+#   results_partial.jsonl   one line per completed method (append-only)
+#   models/<method>.pt      trained baseline weights
 #
-# On re-run: completed methods are skipped; partially-evaluated methods
-# resume from the last saved episode; trained models are loaded, not retrained.
+# On re-run, completed methods are skipped, partially evaluated methods resume
+# from the last saved episode, and trained baselines are loaded instead of retrained.
 
 _PARTIAL_FILE      = "results_partial.jsonl"
 _EP_CKPT_DIR       = "ep_ckpt"
 _MODELS_DIR        = "models"
-_SYNC_INTERVAL_SEC = 10 * 3600   # fsync to disk every 10 hours
+_SYNC_INTERVAL_SEC = 10 * 3600   # minimum interval between explicit fsync calls
 
 
 class _EpisodeCheckpoint:
-    """Per-episode JSONL checkpoint for a single method evaluation.
+    """Per-episode JSONL checkpoint for one method's evaluation.
 
-    Each line in the JSONL file is one completed episode's raw data.
-    Robust to mid-episode interruption (partial last line is ignored).
-
-    Writes are buffered (f.flush only); os.fsync is called at most once every
-    _SYNC_INTERVAL_SEC seconds so the physical disk write does not add latency
-    to each episode.  The OS page-cache flusher (typically every 30s) provides
-    adequate protection between explicit syncs.
+    Each line holds one completed episode; a truncated last line is ignored on load.
+    Writes are flushed to the OS on every append, and os.fsync is called at most once
+    every _SYNC_INTERVAL_SEC seconds.
     """
 
     def __init__(self, outdir: str, method: str):
@@ -340,17 +317,19 @@ class _EpisodeCheckpoint:
                         pass  # ignore truncated last line
 
     def n_done(self) -> int:
+        """Number of completed episodes."""
         return len(self.episodes)
 
     def append(self, ep_data: Dict) -> None:
+        """Record one completed episode in memory and on disk."""
         import time as _time
         self.episodes.append(ep_data)
         with open(self.path, "a") as f:
             f.write(json.dumps(ep_data) + "\n")
-            f.flush()                            # push to OS buffer (fast)
+            f.flush()
             now = _time.monotonic()
             if now - self._last_sync >= _SYNC_INTERVAL_SEC:
-                os.fsync(f.fileno())             # flush to disk every 10h
+                os.fsync(f.fileno())
                 self._last_sync = now
 
     def to_metrics(self) -> Dict[str, Any]:
@@ -399,7 +378,7 @@ def _load_completed_methods(outdir: str) -> Dict[str, Dict]:
 
 
 def _save_partial_result(outdir: str, row: Dict) -> None:
-    """Append a completed method result to the partial checkpoint (atomic line append)."""
+    """Append a completed method row to results_partial.jsonl and fsync it."""
     path = os.path.join(outdir, _PARTIAL_FILE)
     serialized = {}
     for k, v in row.items():
@@ -416,7 +395,7 @@ def _save_partial_result(outdir: str, row: Dict) -> None:
 
 
 def _save_baseline_model(outdir: str, method: str, agent) -> None:
-    """Save all nn.Module state_dicts from a baseline agent plus normalization stats."""
+    """Save every nn.Module state_dict of a baseline agent plus its state normalization stats."""
     import torch.nn as nn
     models_dir = os.path.join(outdir, _MODELS_DIR)
     os.makedirs(models_dir, exist_ok=True)
@@ -425,7 +404,7 @@ def _save_baseline_model(outdir: str, method: str, agent) -> None:
     for name, val in vars(agent).items():
         if isinstance(val, nn.Module):
             state[name] = val.state_dict()
-    # normalization stats (IQL / TD3+BC / CQL pattern)
+    # State normalization stats (IQL, TD3+BC, CQL and derived agents).
     for attr in ("state_mean", "state_std"):
         v = getattr(agent, attr, None)
         if v is not None:
@@ -453,6 +432,7 @@ def _load_baseline_model(outdir: str, method: str, agent) -> bool:
 
 
 def cvar_lower_tail(x: np.ndarray, alpha: float = 0.15) -> float:
+    """Mean of the values at or below the alpha-quantile (lower-tail CVaR)."""
     x = np.asarray(x, dtype=np.float64)
     if x.size == 0:
         return 0.0
@@ -462,6 +442,7 @@ def cvar_lower_tail(x: np.ndarray, alpha: float = 0.15) -> float:
 
 
 def _discounted_add(ret_d: float, r: float, gamma: float, t: int) -> float:
+    """Return ret_d + gamma**t * r."""
     return float(ret_d + (float(gamma) ** int(t)) * float(r))
 
 
@@ -469,11 +450,12 @@ def _discounted_add(ret_d: float, r: float, gamma: float, t: int) -> float:
 # Evaluation
 # ---------------------------------------------------------------------------
 
-# Module-level state for fork-based parallel eval workers.
-# Set in the parent before forking; children inherit via copy-on-write.
+# State for fork-based parallel evaluation. Set in the parent before forking;
+# workers inherit it via copy-on-write.
 _PARENT_ENV_FACTORY = None
 _PARENT_ACT_FN = None
-_PARENT_CKPT_PATH = None  # File path to which workers append per-episode JSONL.
+_PARENT_CKPT_PATH = None  # JSONL file that workers append episodes to
+_PARENT_BASE_SEED = 0
 _WORKER_ENV = None
 
 
@@ -486,9 +468,8 @@ def _worker_init():
 def _worker_append_progress(ep_data: Dict[str, Any]) -> None:
     """Append a completed episode line to the shared JSONL file.
 
-    Linux append-mode writes are atomic when the payload is below PIPE_BUF
-    (4096 bytes). Each ep_data dict serialized is ~200 bytes, so multiple
-    workers writing concurrently will not interleave lines.
+    Each line is far below PIPE_BUF (4096 bytes), so concurrent append-mode writes
+    from several workers do not interleave on Linux.
     """
     if _PARENT_CKPT_PATH is None:
         return
@@ -498,11 +479,24 @@ def _worker_append_progress(ep_data: Dict[str, Any]) -> None:
         f.flush()
 
 
+def _reseed_planner(act_fn, base_seed: int, ep_index: int) -> None:
+    """Reseed the planner's generator from (base_seed, ep_index).
+
+    Each episode gets an independent action-sampling stream that is the same in
+    sequential and fork-parallel evaluation and reproducible on re-run and resume.
+    Objects without an `rng` attribute are left untouched.
+    """
+    obj = getattr(act_fn, "__self__", act_fn)
+    if hasattr(obj, "rng"):
+        obj.rng = np.random.default_rng([int(base_seed), int(ep_index)])
+
+
 def _worker_run_episode(args):
     """Run a single episode in a forked worker. Returns an ep_data dict."""
     actual_ei, ep_seed, max_steps, gamma = args
     env = _WORKER_ENV
     act_fn = _PARENT_ACT_FN
+    _reseed_planner(act_fn, _PARENT_BASE_SEED, actual_ei)
     obs, _ = env.reset(seed=int(ep_seed))
     ep_ret = 0.0
     ep_ret_d = 0.0
@@ -538,9 +532,8 @@ def _worker_run_episode(args):
         "fallback_frac": fb_count / max(1, cov_count),
         "coverage":      cov_sum / max(1, cov_count),
     }
-    # Per-episode progress: each worker appends its own line as soon as the
-    # episode finishes, so the JSONL file grows live. Reading the file from
-    # outside (wc -l) gives the live count of completed episodes.
+    # Each worker appends its episode as soon as it finishes, so the line count
+    # of the JSONL file is the number of completed episodes.
     _worker_append_progress(ep_data)
     return ep_data
 
@@ -555,15 +548,21 @@ def _eval_policy_episodic(
     ckpt: Optional["_EpisodeCheckpoint"] = None,
     env_factory: Optional[Callable[[], Any]] = None,
     n_workers: int = 1,
+    seed_stride: int = 1,
 ) -> Dict[str, Any]:
-    """
-    Evaluate a policy for n_episodes. Returns aggregated metrics dict.
+    """Evaluate a policy for n_episodes and return aggregated metrics.
 
-    For locomotion: success = episode not terminated early (survived).
-    Fallback/coverage come from act_fn.last_root_fallback / last_root_coverage hooks.
+    The environment seed of episode i is `seed * seed_stride + i`. With stride 1,
+    cells with adjacent seeds share most initial states; a stride >= n_episodes gives
+    every cell a disjoint range. All methods of a cell see the same initial states,
+    so comparisons within a cell are paired.
 
-    If ckpt is provided, episodes are checkpointed one by one. On re-run the
-    function skips already-completed episodes and resumes from where it left off.
+    Success means the episode was not terminated early. Fallback rate and coverage
+    are read from the planner's `last_root_fallback` / `last_root_coverage` attributes.
+
+    With `ckpt`, episodes are checkpointed one by one and a re-run resumes after the
+    last completed episode. With `n_workers > 1` and an `env_factory`, episodes run in
+    a fork-based process pool, one environment per worker.
     """
     n_already = ckpt.n_done() if ckpt is not None else 0
     n_todo    = max(0, int(n_episodes) - n_already)
@@ -574,17 +573,17 @@ def _eval_policy_episodic(
     if n_todo == 0 and ckpt is not None:
         return ckpt.to_metrics()
 
-    # ── Parallel branch: fork-based pool, one env per worker, act_fn via COW ──
+    # ── Parallel branch: fork-based pool, one env per worker, act_fn via copy-on-write ──
     if n_workers > 1 and env_factory is not None and n_todo > 1:
         import multiprocessing as _mp
-        global _PARENT_ENV_FACTORY, _PARENT_ACT_FN, _PARENT_CKPT_PATH
+        global _PARENT_ENV_FACTORY, _PARENT_ACT_FN, _PARENT_CKPT_PATH, _PARENT_BASE_SEED
         _PARENT_ENV_FACTORY = env_factory
         _PARENT_ACT_FN = act_fn
-        # Workers append directly to the JSONL file as each episode finishes,
-        # giving live per-episode progress visibility (cat / wc -l works).
+        _PARENT_BASE_SEED = int(seed)
         _PARENT_CKPT_PATH = ckpt.path if ckpt is not None else None
         tasks = [
-            (n_already + ei, int(seed + n_already + ei), int(max_steps), float(gamma))
+            (n_already + ei, int(seed * seed_stride + n_already + ei),
+             int(max_steps), float(gamma))
             for ei in range(n_todo)
         ]
         n_workers_eff = min(int(n_workers), len(tasks))
@@ -592,13 +591,12 @@ def _eval_policy_episodic(
         ctx = _mp.get_context("fork")
         with ctx.Pool(processes=n_workers_eff, initializer=_worker_init) as pool:
             results = pool.map(_worker_run_episode, tasks)
-        # Release parent refs so workers from later calls don't capture stale state.
+        # Clear the globals so later forks do not inherit this call's state.
         _PARENT_ENV_FACTORY = None
         _PARENT_ACT_FN = None
         _PARENT_CKPT_PATH = None
         if ckpt is not None:
-            # Workers already wrote each episode line directly. Reload the ckpt
-            # from disk to refresh the in-memory list (avoids double-writing).
+            # Workers wrote the episodes to disk; reload instead of appending again.
             ckpt.episodes = []
             ckpt._load()
             return ckpt.to_metrics()
@@ -629,12 +627,13 @@ def _eval_policy_episodic(
     XVEL = []
 
     for ei in range(n_todo):
-        actual_ei = n_already + ei  # deterministic seed offset across resume
-        obs, _ = env.reset(seed=int(seed + actual_ei))
+        actual_ei = n_already + ei  # global episode index, stable across resume
+        _reseed_planner(act_fn, seed, actual_ei)
+        obs, _ = env.reset(seed=int(seed * seed_stride + actual_ei))
         ep_ret = 0.0
         ep_ret_d = 0.0
         ep_len = 0
-        ep_survived = True   # flipped to False if terminated (fell)
+        ep_survived = True
         ep_xvel_sum = 0.0
         fb_count = 0
         cov_sum  = 0.0
@@ -642,7 +641,7 @@ def _eval_policy_episodic(
 
         for t in range(int(max_steps)):
             a = act_fn(obs)
-            # act_fn may be a bound method; attributes are on __self__, not on the method object
+            # For a bound method the planner attributes live on __self__.
             _act_obj = getattr(act_fn, "__self__", act_fn)
             fb_count  += int(bool(getattr(_act_obj, "last_root_fallback",  False)))
             cov_sum   += float(getattr(_act_obj, "last_root_coverage", 0.0))
@@ -657,7 +656,7 @@ def _eval_policy_episodic(
                 ep_xvel_sum += float(info.get("x_velocity", 0.0))
 
             if terminated:
-                ep_survived = False  # agent fell
+                ep_survived = False
 
             if terminated or truncated:
                 break
@@ -683,7 +682,7 @@ def _eval_policy_episodic(
         if ckpt is not None:
             ckpt.append(ep_data)
 
-    # If checkpoint exists, aggregate over ALL episodes (pre-existing + new)
+    # With a checkpoint, aggregate over resumed and new episodes together.
     if ckpt is not None:
         return ckpt.to_metrics()
 
@@ -723,6 +722,7 @@ def run_ppo_training(
     out_path: str,
     net: str = "64,64",
 ) -> str:
+    """Train a PPO behavior policy in a subprocess and return the checkpoint path."""
     train_script = os.path.join(os.path.dirname(__file__), "train_ppo_continuous.py")
     ensure_dir(os.path.dirname(out_path) or ".")
     cmd = [
@@ -751,11 +751,10 @@ def collect_dataset(
     max_steps: int,
     seed: int,
 ) -> Dict[str, np.ndarray]:
-    """
-    Collect n_trajs episodes from PPO. Returns flat-obs dataset.
+    """Collect n_trajs episodes with the stochastic PPO policy.
 
-    Stored format compatible with EnsembleDynamicsSB3.fit_from_transitions
-    when obs are wrapped as {"observation": obs}.
+    Returns flat arrays obs, actions, rewards, obs_next, dones; episode i is reset with
+    seed `seed * 1000 + i`. `dones` marks both termination and truncation.
     """
     obs_list, act_list, rew_list, obs_next_list, done_list = [], [], [], [], []
 
@@ -788,21 +787,12 @@ def split_train_calib(
     calib_frac: float,
     seed: int,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
-    """
-    Trajectory-level split of `dataset` into (train, calibration).
+    """Trajectory-level split of `dataset` into (train, calibration).
 
-    Episodes are partitioned whole: no trajectory crosses the boundary. All
-    transitions of the calibration episodes are returned as `D_calib`; no
-    per-episode i.i.d. subsampling is performed. The downstream Wilks check
-    uses the per-bin sample size computed on this full calibration block,
-    and the triple split `D_bin / D_wilks / D_thr` is applied as a random
-    three-way partition inside `fit_calibrator`.
-
-    Intra-episode correlation is acknowledged as a second-order effect for
-    smooth continuous dynamics; keeping the full calibration block restores
-    the pre-Wilks-strict sample-complexity regime while preserving the
-    automatic Wilks-based B* / n_b gating and the conservative collapse on
-    insufficient data.
+    Episodes are assigned whole, so no trajectory crosses the boundary; a
+    calib_frac fraction of episodes (at least one) goes to calibration. All transitions
+    of the calibration episodes are returned without subsampling. The D_bin / D_wilks /
+    D_thr partition is drawn later, inside `fit_calibrator`.
     """
     rng = np.random.default_rng(seed)
 
@@ -839,16 +829,14 @@ def triple_split_calib_iid(
     n: int,
     seed: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Partition `n` i.i.d. calibration indices into three disjoint blocks of
-    (approximately) equal size:
-      D_bin  : used to fit quantile bin edges on u
-      D_wilks: used to compute per-bin Wilks upper tolerance limits B_b
-               (with bin edges fixed from D_bin)
-      D_thr  : used to compute eps_gate = Quantile_{q_eps}(B(u_n))
-               (with calibrator B fixed from D_bin + D_wilks)
+    """Randomly partition `n` calibration indices into three disjoint blocks.
 
-    Returns (idx_bin, idx_wilks, idx_thr) as numpy int64 arrays.
+    D_bin fits the quantile bin edges on u, D_wilks the per-bin Wilks upper tolerance
+    limits B_b given those edges, and D_thr the threshold eps = Quantile_{q_eps}(B(u_n))
+    given B. The first two blocks have n // 3 elements; D_thr takes the remainder.
+
+    Returns:
+        (idx_bin, idx_wilks, idx_thr) as int64 arrays.
     """
     rng = np.random.default_rng(seed)
     perm = rng.permutation(int(n))
@@ -878,8 +866,17 @@ def train_ensemble(
     bootstrap: bool = True,
     ensemble_size: int = 4,
     hidden_dims: Optional[Tuple[int, ...]] = None,
+    target_normalize: bool = False,
+    scale_aware_uncertainty: bool = False,
 ) -> EnsembleDynamicsSB3:
-    """Train ensemble on transition data. Wraps obs as dict internally."""
+    """Train the dynamics ensemble on flat transitions (wrapped as {"observation": obs}).
+
+    `target_normalize` or `scale_aware_uncertainty` selects EnsembleDynamicsV2.
+    `target_normalize` standardizes the regression target per dimension during
+    training and folds the de-normalization into the output layer, so the result is
+    still a raw-delta predictor and only the loss weighting across output dimensions
+    changes. Both are off by default, which gives the base MSE ensemble.
+    """
     kwargs = dict(
         seed=seed,
         epochs=epochs,
@@ -890,8 +887,13 @@ def train_ensemble(
     if hidden_dims is not None:
         kwargs["hidden_dims"] = tuple(hidden_dims)
     cfg = EnsembleTrainConfig(**kwargs)
-    ens = EnsembleDynamicsSB3(obs_dim=obs_dim, act_dim=act_dim, cfg=cfg)
-    # Wrap flat obs as {"observation": ...} for fit_from_transitions
+    if target_normalize or scale_aware_uncertainty:
+        from safe_rl.offline.ensemble_dynamics_v2 import EnsembleDynamicsV2
+        ens = EnsembleDynamicsV2(obs_dim=obs_dim, act_dim=act_dim, cfg=cfg,
+                                 normalize_targets=bool(target_normalize),
+                                 scale_aware_uncertainty=bool(scale_aware_uncertainty))
+    else:
+        ens = EnsembleDynamicsSB3(obs_dim=obs_dim, act_dim=act_dim, cfg=cfg)
     obs_d      = {"observation": dataset["obs"]}
     obs_next_d = {"observation": dataset["obs_next"]}
     ens.fit_from_transitions(obs_d, dataset["actions"], obs_next_d, verbose=True)
@@ -899,14 +901,12 @@ def train_ensemble(
 
 
 def wilks_min_n_per_bin(n_bins_eff: int, delta: float, alpha: float = 0.05) -> int:
-    """
-    Wilks (1941) minimum samples per bin for coverage guarantee.
+    """Minimum per-bin sample size for the Wilks tolerance limit.
 
-    Wilks theorem: P(F(e_(n)) >= 1-delta) = 1-(1-delta)^n
-    With Bonferroni correction over B bins:
-        n_b >= log(alpha/B) / log(1-delta)
-
-    Returns the integer ceiling of this threshold.
+    The bin maximum satisfies P(F(e_(n)) >= 1 - delta) = 1 - (1 - delta)^n. With a
+    Bonferroni correction over B bins this requires
+        n_b >= log(alpha / B) / log(1 - delta).
+    Returns the ceiling of this threshold, or 0 for invalid arguments.
     """
     import math
     if n_bins_eff <= 0 or delta <= 0 or delta >= 1:
@@ -919,25 +919,13 @@ def wilks_min_n_per_bin(n_bins_eff: int, delta: float, alpha: float = 0.05) -> i
 
 
 def wilks_optimal_bins(N_cal: int, delta: float = 0.05, alpha: float = 0.05) -> int:
-    """
-    Compute the Wilks-optimal number of calibration bins B* given N_cal samples.
+    """Largest bin count B* admissible for N_cal calibration samples.
 
-    B* is the largest B satisfying the sample-complexity condition
-    (eq. ncal-wilks in pac_guarantees.tex):
-
-        N_cal >= (B / delta) * log(B / alpha)
-
-    This is the inverse of the Wilks condition: given a fixed calibration
-    budget N_cal, it returns the maximum number of bins whose per-bin
-    quantile estimates are statistically valid (confidence >= 1-alpha/B
-    per bin, Bonferroni-corrected).
-
-    B* grows as O(N_cal / log(N_cal)).  Examples (delta=alpha=0.05):
-      N_cal=1000  -> B*=8   (20 bins would need N_cal>=2396, currently used: WRONG)
-      N_cal=10000 -> B*=38
-      N_cal=100000-> B*=170
-
-    Binary search in [1, N_cal].
+    B* is the largest B with
+        N_cal >= (B / delta) * log(B / alpha),
+    i.e. the largest number of bins whose per-bin bounds hold with confidence
+    1 - alpha / B each. B* grows as O(N_cal / log N_cal). Found by binary search
+    on [1, N_cal].
     """
     import math
     if N_cal <= 0:
@@ -960,27 +948,24 @@ def wilks_eps_check(
     delta: float,
     alpha: float = 0.05,
 ) -> Tuple[float, bool, int, int]:
-    """
-    Check Wilks sample-complexity condition per bin.
+    """Check the per-bin Wilks sample-size condition on u_cal.
 
-    Returns (eps_out, is_valid, n_b_min, wilks_threshold) where:
-      - eps_out = eps if valid, np.inf if Wilks condition violated
-      - is_valid = True iff every effective bin has >= wilks_threshold samples
-      - n_b_min = minimum samples across effective bins
-      - wilks_threshold = required minimum per bin (Bonferroni-corrected)
+    Returns:
+        (eps_out, is_valid, n_b_min, wilks_threshold): eps_out is eps if every
+        effective bin has at least wilks_threshold samples and -inf otherwise
+        (conservative collapse); n_b_min is the smallest bin count.
     """
     edges = calibrator.bin_edges
     n_bins_eff = len(calibrator.bin_bounds)
     threshold = wilks_min_n_per_bin(n_bins_eff, delta, alpha)
 
-    # Count samples per effective bin
     bin_idx = np.clip(np.digitize(u_cal, edges[1:-1], right=False), 0, n_bins_eff - 1)
     counts = np.array([int(np.sum(bin_idx == b)) for b in range(n_bins_eff)])
     n_b_min = int(counts.min()) if counts.size > 0 else 0
 
     is_valid = n_b_min >= threshold
-    # Conservative collapse: eps=-inf makes B(u) <= eps always False -> A_safe=∅ -> fallback PPO
-    # (eps=+inf would be wrong: it would make all actions safe)
+    # eps = -inf makes B(u) <= eps false everywhere, so A_safe is empty and the
+    # policy falls back to PPO. +inf would certify every action.
     eps_out = eps if is_valid else float("-inf")
     return eps_out, is_valid, n_b_min, threshold
 
@@ -997,38 +982,27 @@ def calib_min_bins_check(
     ds: int,
     alpha: float = 0.05,
 ) -> float:
-    """
-    Enforce the min-bins discriminability condition and print a full diagnostic.
+    """Enforce the minimum bin count implied by q_eps and print a calibration summary.
 
-    The minimum number of bins is derived automatically from q_eps:
+    The minimum is calib_min_bins = ceil(1 / (1 - q_eps)), e.g. 20 for q_eps = 0.95.
+    With quantile binning each bin holds a 1/B fraction of D_cal. If
+    1/B >= 1 - q_eps, eps equals the bound of the last bin, and since B(u) is clamped
+    to that bound for u above the calibration range, the gate would certify every
+    out-of-distribution action. With B >= calib_min_bins, eps lies below the last bound.
 
-        calib_min_bins = ceil(1 / (1 - q_eps))
-
-    Proof: with quantile binning, bin i covers fraction 1/B of D_cal.
-    eps = quantile_{q_eps}(B(u_calib)).  The last bin covers the top 1/B
-    fraction of D_cal.  If 1/B >= (1-q_eps), then eps = B_last (the
-    highest bin bound): for OOD actions with u > u_max, bound() returns
-    B_last = eps → B(u) <= eps is ALWAYS True → gate never blocks OOD.
-    Requiring B > 1/(1-q_eps), i.e., B >= ceil(1/(1-q_eps)), ensures the
-    last bin covers < (1-q_eps) of D_cal → eps < B_last → OOD is blocked.
-
-    For q_eps=0.95:  calib_min_bins = ceil(1/0.05) = 20  (paper value).
-    For q_eps=0.90:  calib_min_bins = ceil(1/0.10) = 10.
-    For q_eps=0.99:  calib_min_bins = ceil(1/0.01) = 100.
-
-    Returns eps_raw if B* >= calib_min_bins, -inf otherwise (conservative
-    collapse, Prop. 2).
+    Returns:
+        eps_raw if bins >= calib_min_bins, otherwise -inf (conservative collapse).
     """
     calib_min_bins = math.ceil(1.0 / (1.0 - q_eps))
 
-    # Exit condition: min N_cal for B* >= calib_min_bins
+    # Smallest N_cal for which B* >= calib_min_bins.
     n_cal_exit = int(math.ceil((calib_min_bins / delta) * math.log(calib_min_bins / alpha)))
 
-    # Estimate trajectories needed to exit (based on current avg episode length)
+    # Number of trajectories needed to reach it, at the current mean episode length.
     avg_ep_len = (n_cal / (calib_frac * max(1, ds))) if (calib_frac * ds) > 0 else 1.0
     n_trajs_exit = int(math.ceil(n_cal_exit / max(1.0, avg_ep_len * calib_frac)))
 
-    # Wilks total condition for the chosen B
+    # Total-sample Wilks condition for the chosen B.
     n_cal_for_b = int(math.ceil((bins / delta) * math.log(bins / alpha))) if bins > 0 else 0
     wilks_total_ok = n_cal >= n_cal_for_b
 
@@ -1059,7 +1033,7 @@ def calib_min_bins_check(
             flush=True,
         )
         print(f"  eps (would be)     : {eps_raw:.4f} \u2192 overridden to -inf", flush=True)
-        print(f"  \u2192 Cal-SPI \u2261 PPO (conservative collapse, Prop. 2)", flush=True)
+        print(f"  \u2192 Cal-SPI \u2261 PPO (conservative collapse)", flush=True)
         print(
             f"  Exit condition     : N_cal >= {n_cal_exit}"
             f"  (~{n_trajs_exit} trajs at avg_ep_len\u2248{avg_ep_len:.0f})",
@@ -1077,10 +1051,10 @@ def calib_min_bins_check(
 
 
 def _parse_candidate_bins(spec: Optional[str]) -> Optional[List[int]]:
-    """
-    Parse a CLI string of comma-separated bin counts (e.g. "20,40,80") into
-    a list of ints. Returns None on empty/blank/None to trigger the default
-    theory-grounded candidate set (see `_theory_candidate_bins`).
+    """Parse a comma-separated list of bin counts (e.g. "20,40,80").
+
+    Values below 2 and unparsable tokens are dropped. Returns None for an empty spec,
+    which selects the default set from `_theory_candidate_bins`.
     """
     if spec is None:
         return None
@@ -1102,13 +1076,9 @@ def _parse_candidate_bins(spec: Optional[str]) -> Optional[List[int]]:
 
 
 def _theory_candidate_bins(q_eps: float, K: int = 4) -> List[int]:
-    """
-    Paper-canonical default candidate set for the bin count B.
+    """Default candidate bin counts {B_min, 2 B_min, ..., K B_min}.
 
-    Starts at B_min = ceil(1/(1-q_eps)) and grows in a linear sequence
-    {B_min, 2 B_min, 3 B_min, 4 B_min}. For the paper q_eps = 0.95 this
-    yields the canonical {20, 40, 60, 80} reported in the appendix
-    Tab. calspi-config; pass --calib_candidate_bins to override.
+    B_min = ceil(1 / (1 - q_eps)); q_eps = 0.95 and K = 4 give {20, 40, 60, 80}.
     """
     Bm = int(math.ceil(1.0 / max(1e-12, 1.0 - float(q_eps))))
     return [int(Bm * (k + 1)) for k in range(int(K))]
@@ -1128,29 +1098,31 @@ def fit_calibrator(
     random_seed: int = 0,
     legacy_mode: bool = False,
 ) -> Tuple[UncertaintyCalibrator, float, np.ndarray, np.ndarray]:
-    """
-    Fit calibrator on calibration data. Returns (calibrator, eps, u_calib, e_calib).
+    """Fit the calibrated bound B(u) and the gate threshold eps on calibration data.
 
-    uncertainty_type: "usad" (CSPI-U, max pairwise disagreement) or
-                      "epistemic" (CSPI-V, mean epistemic variance across dims).
+    Args:
+        uncertainty_type: "usad" (max pairwise disagreement of the member means) or
+            "epistemic" (mean per-dimension variance of the member means).
+        triple_split: split the calibration sample into D_bin (bin edges), D_wilks
+            (per-bin Wilks bounds) and D_thr (eps). Each candidate B in
+            `candidate_bins` (or `single_B_override`, or the default set) is fitted,
+            and B is selected with the one-standard-error rule over bootstrap
+            estimates of eps. With False, or with fewer than 10 samples per block,
+            edges, bounds and eps are fitted jointly on the whole sample, which does
+            not give the data independence required by the coverage guarantee.
+        legacy_mode: with the triple split, use B = B* (or cfg.n_bins), per-bin
+            empirical (1 - delta)-quantiles and a plain alpha / B correction.
 
-    triple_split: if True, partition the i.i.d. calibration sample into three
-        disjoint blocks D_bin, D_wilks, D_thr and fit bin edges on D_bin,
-        per-bin Wilks bounds on D_wilks, and the threshold eps on D_thr.
-        This is the pipeline whose Wilks coverage guarantees match the paper
-        theorem (Section~\\ref{sec:method}). If False, fit bins, bounds, and
-        threshold jointly on the full calibration sample (legacy single-split
-        pipeline used in pre-triple-split caches): numerically close in most
-        operational regimes but without the formal data-independence needed
-        for the tolerance-limit proof.
-    Wilks check: if minimum samples per effective bin < Wilks threshold
-    (Bonferroni-corrected), eps is set to inf → conservative collapse (Prop. 2).
+    If some effective bin has fewer samples than the Wilks threshold, eps is set to
+    -inf (conservative collapse).
+
+    Returns:
+        (calibrator, eps, u_calib, e_calib).
     """
     obs_flat  = calib_dataset["obs"]
     actions   = calib_dataset["actions"]
     obs_next  = calib_dataset["obs_next"]
 
-    # Uncertainty: USAD or epistemic variance on (s, a)
     if uncertainty_type == "usad":
         u_calib = np.array([
             ens.uncertainty_usad({"observation": obs_flat[i]}, actions[i])
@@ -1162,21 +1134,26 @@ def fit_calibrator(
             for i in range(len(obs_flat))
         ], dtype=np.float32)
 
-    # Error: ||mu_bar(s,a) - s'||_2
-    e_calib = np.array([
-        float(np.linalg.norm(
-            ens.predict_next_obs_vec_mean({"observation": obs_flat[i]}, actions[i])
-            - obs_next[i]
-        ))
-        for i in range(len(obs_flat))
-    ], dtype=np.float32)
+    # Error e = ||mu_bar(s, a) - s'||_2. With a scale-aware V2 ensemble, u and e are
+    # both computed on deltas divided by their per-dimension scale, so no state
+    # component dominates because of its units.
+    if hasattr(ens, "calibration_error") and getattr(ens, "scale_aware_uncertainty", False):
+        e_calib = np.array([
+            ens.calibration_error(obs_flat[i], actions[i], obs_next[i])
+            for i in range(len(obs_flat))
+        ], dtype=np.float32)
+    else:
+        e_calib = np.array([
+            float(np.linalg.norm(
+                ens.predict_next_obs_vec_mean({"observation": obs_flat[i]}, actions[i])
+                - obs_next[i]
+            ))
+            for i in range(len(obs_flat))
+        ], dtype=np.float32)
 
-    # Triple split on the i.i.d. calibration sample (fix 1+2 of the main paper):
-    # D_bin fits bin edges, D_wilks constructs per-bin bounds on those fixed edges,
-    # D_thr evaluates the empirical q_eps quantile of B(u). Each block is independent
-    # of the downstream statistic, so the Wilks coverage guarantees apply without
-    # data-dependent binning artefacts. When `triple_split=False`, the pipeline
-    # falls back to the joint single-split fit used by the legacy cache.
+    # D_bin fits bin edges, D_wilks the per-bin bounds on those edges, D_thr the
+    # q_eps quantile of B(u). Each block is independent of the statistic fitted on
+    # the next, which is what the Wilks coverage guarantee requires.
     idx_bin, idx_wilks, idx_thr = triple_split_calib_iid(
         n=int(u_calib.shape[0]), seed=0
     )
@@ -1188,7 +1165,7 @@ def fit_calibrator(
         and idx_thr.size >= _need_min
         and not legacy_mode
     ):
-        # Resolve candidate set: explicit candidate_bins > legacy single_B_override > theory default.
+        # Candidate set: candidate_bins, else single_B_override, else the default set.
         if candidate_bins is not None and len(candidate_bins) > 0:
             cand_list = [int(B) for B in candidate_bins if int(B) >= 2]
         elif single_B_override is not None and int(single_B_override) > 0:
@@ -1216,8 +1193,8 @@ def fit_calibrator(
                     edges_B[i] = edges_B[i - 1] + 1e-12
             bin_edges_per_B[int(B)] = edges_B
 
-        # Pass 2+3: per-bin Wilks bounds on D_wilks, eps_B on D_thr,
-        # and one-SE rule selection of B_dagger over the candidate set.
+        # Passes 2-3: per-bin Wilks bounds on D_wilks, eps_B on D_thr, and
+        # one-standard-error selection of B_dagger over the candidates.
         calibrator, eps_raw, sel_diag = UncertaintyCalibrator.fit_with_selection(
             u_wilks=u_calib[idx_wilks],
             e_wilks=e_calib[idx_wilks],
@@ -1230,7 +1207,7 @@ def fit_calibrator(
             random_seed=int(random_seed),
         )
 
-        # Console diagnostics: per-candidate table + selection.
+        # Per-candidate table and selected B.
         print(
             f"[CALIB] Triple-split + candidate sweep: N_cal={u_calib.shape[0]} "
             f"(bin={idx_bin.size}, wilks={idx_wilks.size}, thr={idx_thr.size}); "
@@ -1270,11 +1247,9 @@ def fit_calibrator(
         and idx_wilks.size >= _need_min
         and idx_thr.size >= _need_min
     ):
-        # Legacy reproducibility mode: pre-refactor pipeline.
-        #   B = wilks_optimal_bins(N_fit)  (max admissible Wilks)
-        #   mode = "quantile" (1-delta empirical quantile per bin)
-        #   alpha/B Bonferroni (no candidate-set correction)
-        # Used to numerically reproduce paper-recent results.
+        # Legacy mode: B = wilks_optimal_bins(|D_wilks|) unless cfg.n_bins is set,
+        # per-bin empirical (1 - delta)-quantile, alpha / B Bonferroni correction
+        # without a correction for the candidate set.
         u_bin = u_calib[idx_bin]
         _n_fit = idx_wilks.size
         if int(cfg.n_bins) > 0:
@@ -1307,10 +1282,8 @@ def fit_calibrator(
             flush=True,
         )
     else:
-        # Legacy single-split fit: bins, per-bin bounds, and eps all computed
-        # on the same calibration sample. Used either when the user disables
-        # the triple-split pipeline explicitly (`--calib_triple_split 0`) or
-        # when N_cal is too small to afford a three-way partition.
+        # Single-split fit: edges, per-bin bounds and eps on the same sample. Used
+        # with --calib_triple_split 0 or when N_cal is too small for three blocks.
         calibrator = UncertaintyCalibrator.fit(u_calib, e_calib, cfg=cfg)
         eps_raw = float(np.quantile(calibrator.bound_batch(u_calib), float(q_eps)))
         if not triple_split:
@@ -1323,7 +1296,7 @@ def fit_calibrator(
             flush=True,
         )
 
-    # Wilks check: enforce conservative collapse if per-bin samples insufficient
+    # Conservative collapse if some bin has too few samples.
     eps, wilks_ok, n_b_min, wilks_thr = wilks_eps_check(
         u_calib, calibrator, eps_raw, cfg.delta, wilks_alpha
     )
@@ -1339,7 +1312,7 @@ def fit_calibrator(
         print(
             f"[CALIB] Wilks FAIL: n_b_min={n_b_min} < {wilks_thr} "
             f"(B={n_bins_eff}, delta={cfg.delta}, alpha={wilks_alpha}) "
-            f"-> eps=inf (conservative collapse, Prop. 2)",
+            f"-> eps=-inf (conservative collapse)",
             flush=True,
         )
 
@@ -1351,12 +1324,11 @@ def fit_calibrator(
 # ---------------------------------------------------------------------------
 
 def _select_planner_class(backend: str):
-    """Select MCTS planner class based on backend flag.
+    """Return the non-CSPI planner class for a backend name.
 
-    Returns the original planner on 'original' or any unknown value (safe default).
-    Returns the batched planner on 'batched'. The batched planner is a drop-in
-    replacement that produces byte-identical actions under fixed_per_sim sampling
-    (verified by tests/test_mcts_parity.py).
+    'batched' selects the batched planner, which produces the same actions as the
+    original planner under fixed_per_sim sampling; any other value selects the
+    original planner.
     """
     if str(backend) == "batched":
         return OfflineMCTS_DPW_PPO_Batched
@@ -1381,19 +1353,14 @@ def make_mcts_calibrated(
     cspi_n_min_root_visits: int = 3,
     use_ppo_leaf_value: bool = False,
 ):
-    """
-    Build the calibrated MCTS planner used by all paper experiments.
+    """Build the Cal-SPI planner with the USAD gate.
 
-    The returned planner is the conservative CSPI variant: it inserts the
-    baseline action `a_b = pi_b(s)` at the root, runs the calibrated MCTS
-    search, and switches away from `a_b` only when the safety margin
-    `Q_hat_safe(a*) - V_hat_b(s) >= Delta_margin` is satisfied. Otherwise it
-    falls back to `a_b`. This is the deployed policy of the main paper
-    (Definition `def:cspi-conservative`, Theorem `thm:cspi`); there is no
-    separate "unconditional" variant in the experiments.
+    The planner inserts the baseline action a_b = pi_b(s) at the root, runs MCTS-DPW
+    over gate-certified actions, and switches away from a_b only when
+    Q_hat_safe(a*) - V_hat_b(s) >= Delta_margin (baseline-relative switch); otherwise
+    it returns a_b. `cspi_margin_mult = 0` gives the plain argmax over A_safe.
 
-    `cspi_margin_mult = 0` recovers the unconditional argmax over A_safe
-    and is intended only as an internal sanity knob, not for paper runs.
+    `backend` is one of original, batched, numba, numba_scaled, array.
     """
     from safe_rl.algorithms.offline.cal_spi.mcts_cspi import (
         OfflineMCTS_DPW_PPO_SPIBB_CSPI_Parametric,
@@ -1404,6 +1371,7 @@ def make_mcts_calibrated(
     mcts_cfg.gate_mode = "calibrated"
     mcts_cfg.uncertainty_type = "usad"
 
+    extra = {}
     if str(backend) == "batched":
         PlannerCls = OfflineMCTS_DPW_PPO_Batched_CSPI
     elif str(backend) == "numba":
@@ -1411,6 +1379,32 @@ def make_mcts_calibrated(
             OfflineMCTS_DPW_PPO_Numba_CSPI,
         )
         PlannerCls = OfflineMCTS_DPW_PPO_Numba_CSPI
+    elif str(backend) == "array":
+        # Compiled search loop over preallocated buffers; produces the same
+        # actions as the numba backend for the same seed.
+        from safe_rl.algorithms.offline.cal_spi.mcts_array import (
+            OfflineMCTS_DPW_PPO_Array_CSPI,
+        )
+        PlannerCls = OfflineMCTS_DPW_PPO_Array_CSPI
+        # The gate must score the statistic the calibrator bounded, so delta_scale
+        # is passed exactly when the ensemble uses scale-aware uncertainty.
+        if getattr(ens, "scale_aware_uncertainty", False):
+            _sc = getattr(ens, "delta_scale", None)
+            if _sc is None:
+                raise ValueError(
+                    "the ensemble declares a scale-aware uncertainty but carries "
+                    "no delta_scale; the planner would gate on the unscaled "
+                    "statistic while the calibrator bounded the scaled one"
+                )
+            extra["delta_scale"] = _sc
+    elif str(backend) == "numba_scaled":
+        # Scale-aware gate: disagreement is scored on scaled deltas, matching the
+        # statistic bounded by a scale-aware calibrator.
+        from safe_rl.algorithms.offline.cal_spi.mcts_numba_scaled import (
+            OfflineMCTS_DPW_PPO_Numba_CSPI_Scaled,
+        )
+        PlannerCls = OfflineMCTS_DPW_PPO_Numba_CSPI_Scaled
+        extra["delta_scale"] = getattr(ens, "delta_scale", None)
     else:
         PlannerCls = OfflineMCTS_DPW_PPO_SPIBB_CSPI_Parametric
 
@@ -1430,6 +1424,7 @@ def make_mcts_calibrated(
         cspi_delta_piB=float(cspi_delta_piB),
         cspi_frozen_root=bool(cspi_frozen_root),
         cspi_n_min_root_visits=int(cspi_n_min_root_visits),
+        **extra,
     )
 
 
@@ -1450,7 +1445,7 @@ def make_mcts_calibrated_var(
     cspi_frozen_root: bool = True,
     cspi_n_min_root_visits: int = 3,
 ):
-    """Build calibrated MCTS planner using epistemic variance as uncertainty (CSPI-V)."""
+    """Build the Cal-SPI planner with the epistemic-variance gate; see make_mcts_calibrated."""
     from safe_rl.algorithms.offline.cal_spi.mcts_cspi import (
         OfflineMCTS_DPW_PPO_SPIBB_CSPI_Parametric,
         OfflineMCTS_DPW_PPO_Batched_CSPI,
@@ -1460,6 +1455,7 @@ def make_mcts_calibrated_var(
     mcts_cfg.gate_mode     = "calibrated"
     mcts_cfg.uncertainty_type = "epistemic"
 
+    extra = {}
     if str(backend) == "batched":
         PlannerCls = OfflineMCTS_DPW_PPO_Batched_CSPI
     elif str(backend) == "numba":
@@ -1467,6 +1463,32 @@ def make_mcts_calibrated_var(
             OfflineMCTS_DPW_PPO_Numba_CSPI,
         )
         PlannerCls = OfflineMCTS_DPW_PPO_Numba_CSPI
+    elif str(backend) == "array":
+        # Compiled search loop over preallocated buffers; produces the same
+        # actions as the numba backend for the same seed.
+        from safe_rl.algorithms.offline.cal_spi.mcts_array import (
+            OfflineMCTS_DPW_PPO_Array_CSPI,
+        )
+        PlannerCls = OfflineMCTS_DPW_PPO_Array_CSPI
+        # The gate must score the statistic the calibrator bounded, so delta_scale
+        # is passed exactly when the ensemble uses scale-aware uncertainty.
+        if getattr(ens, "scale_aware_uncertainty", False):
+            _sc = getattr(ens, "delta_scale", None)
+            if _sc is None:
+                raise ValueError(
+                    "the ensemble declares a scale-aware uncertainty but carries "
+                    "no delta_scale; the planner would gate on the unscaled "
+                    "statistic while the calibrator bounded the scaled one"
+                )
+            extra["delta_scale"] = _sc
+    elif str(backend) == "numba_scaled":
+        # Scale-aware gate: disagreement is scored on scaled deltas, matching the
+        # statistic bounded by a scale-aware calibrator.
+        from safe_rl.algorithms.offline.cal_spi.mcts_numba_scaled import (
+            OfflineMCTS_DPW_PPO_Numba_CSPI_Scaled,
+        )
+        PlannerCls = OfflineMCTS_DPW_PPO_Numba_CSPI_Scaled
+        extra["delta_scale"] = getattr(ens, "delta_scale", None)
     else:
         PlannerCls = OfflineMCTS_DPW_PPO_SPIBB_CSPI_Parametric
 
@@ -1486,6 +1508,7 @@ def make_mcts_calibrated_var(
         cspi_delta_piB=float(cspi_delta_piB),
         cspi_frozen_root=bool(cspi_frozen_root),
         cspi_n_min_root_visits=int(cspi_n_min_root_visits),
+        **extra,
     )
 
 
@@ -1496,7 +1519,7 @@ def make_mcts_no_gate(
     mcts_cfg: OfflineMCTSConfig,
     seed: int,
 ) -> OfflineMCTS_DPW_Ensemble_UNSAFE:
-    """Build unconstrained MCTS planner (no gate, no PPO prior)."""
+    """Build the unconstrained MCTS planner (no gate, no PPO prior, zero leaf value)."""
     mcts_cfg_unsafe = OfflineMCTSConfig(
         num_sims=mcts_cfg.num_sims,
         max_depth=mcts_cfg.max_depth,
@@ -1526,6 +1549,7 @@ def make_mcts_no_gate(
 # ---------------------------------------------------------------------------
 
 def run_benchmark(args) -> None:
+    """Run every requested method on every (seed, dataset size) cell and write results."""
     domain_cfg = DOMAIN_CONFIGS[args.domain]
     obs_dim    = domain_cfg["obs_dim"]
     act_dim    = domain_cfg["act_dim"]
@@ -1533,7 +1557,7 @@ def run_benchmark(args) -> None:
 
     ppo_path = str(args.ppo_global_path)
 
-    # ── PPO: train once globally ──────────────────────────────────────────
+    # ── Behavior policy: one PPO checkpoint shared by all cells ──────────
     if not os.path.exists(ppo_path):
         print(f"[BENCH] PPO not found at {ppo_path}, training...", flush=True)
         run_ppo_training(
@@ -1554,10 +1578,9 @@ def run_benchmark(args) -> None:
     for seed in args.seeds:
         print(f"\n[BENCH] === seed={seed} ===", flush=True)
 
-        # Environment for this seed (dataset collection + eval)
         env_data = make_continuous_env(args.domain, seed=seed)
         env_eval = make_continuous_env(args.domain, seed=seed)
-        # Factory for fork-based parallel eval workers (each builds its own env)
+        # Each fork-parallel evaluation worker builds its own env from this factory.
         _domain_local = args.domain
         _seed_local = seed
         def _eval_env_factory():
@@ -1569,13 +1592,10 @@ def run_benchmark(args) -> None:
 
             print(f"\n[BENCH] ds={ds} seed={seed}", flush=True)
 
-            # ── Decide whether dataset collection is needed ──────────────
-            # Cal-SPI re-eval with cached ensemble + calibrators does NOT need
-            # the trajectory dataset. We can skip collection entirely when:
-            #   (1) --force_retrain is off
-            #   (2) ensemble.pt + calibrator_usad.pkl + calibration_data_usad.npz
-            #       all exist (and likewise for epistemic if requested)
-            #   (3) every requested method is dataset-free at eval time
+            # ── Dataset ───────────────────────────────────────────────────
+            # Collection is skipped when --force_retrain is off, the ensemble and
+            # calibrator caches exist (epistemic too if requested), and every
+            # requested method needs no dataset at evaluation time.
             _ens_path_pre = os.path.join(str(args.outdir), "ensemble.pt")
             _cal_path_pre = os.path.join(str(args.outdir), "calibrator_usad.pkl")
             _cal_npz_pre  = os.path.join(str(args.outdir), "calibration_data_usad.npz")
@@ -1605,11 +1625,8 @@ def run_benchmark(args) -> None:
                     f"and run_methods={sorted(args.run_methods)} are dataset-free at eval.",
                     flush=True,
                 )
-                # Sentinel empty splits — never read in this branch because the
-                # ensemble/calibrator cache-miss branches are skipped below.
-                # Keys mirror what `split_train_calib` produces so downstream
-                # dataset assembly (e.g. baseline RL agents) doesn't KeyError
-                # when the arrays are empty.
+                # Empty splits with the keys of `split_train_calib`; never read,
+                # since the ensemble and calibrators are loaded from cache.
                 ds_sub = None
                 D_train = {
                     "obs":      np.zeros((0, obs_dim), dtype=np.float32),
@@ -1620,13 +1637,28 @@ def run_benchmark(args) -> None:
                 }
                 D_calib = {k: v.copy() for k, v in D_train.items()}
             else:
-                print(
-                    f"[BENCH] Collecting {ds} trajectories (collect_seed={collect_seed})...",
-                    flush=True,
-                )
-                ds_sub = collect_dataset(
-                    env_data, ppo, n_trajs=ds, max_steps=max_steps, seed=collect_seed
-                )
+                # The dataset is saved next to the ensemble so later runs reuse the
+                # same transitions. PPO samples actions stochastically, so the torch
+                # and numpy global RNGs are seeded before collection.
+                _ds_path = os.path.join(outdir, "dataset.npz")
+                if os.path.exists(_ds_path) and not args.force_retrain:
+                    print(f"[BENCH] Loading dataset from {_ds_path}", flush=True)
+                    _z = np.load(_ds_path)
+                    ds_sub = {k: _z[k] for k in
+                              ("obs", "actions", "rewards", "obs_next", "dones")}
+                else:
+                    print(
+                        f"[BENCH] Collecting {ds} trajectories (collect_seed={collect_seed})...",
+                        flush=True,
+                    )
+                    torch.manual_seed(int(collect_seed))
+                    np.random.seed(int(collect_seed) % (2 ** 32))
+                    ds_sub = collect_dataset(
+                        env_data, ppo, n_trajs=ds, max_steps=max_steps, seed=collect_seed
+                    )
+                    np.savez_compressed(_ds_path, **ds_sub)
+                    print(f"[BENCH] Dataset saved → {_ds_path} "
+                          f"({len(ds_sub['obs'])} transitions)", flush=True)
                 D_train, D_calib = split_train_calib(
                     ds_sub, ds, calib_frac=float(args.calib_frac), seed=seed
                 )
@@ -1637,7 +1669,7 @@ def run_benchmark(args) -> None:
             if os.path.exists(ens_path) and not args.force_retrain:
                 print(f"[BENCH] Loading ensemble from {ens_path}", flush=True)
                 state = torch.load(ens_path, map_location="cpu")
-                # Restore arch from checkpoint if present, else fall back to legacy 512x2 / K=4.
+                # Architecture from the checkpoint; 512x512 and K=4 if not stored.
                 ckpt_hidden = tuple(state.get("hidden_dims", (512, 512)))
                 ckpt_K      = int(state.get("ensemble_size", 4))
                 ens = EnsembleDynamicsSB3(
@@ -1648,11 +1680,16 @@ def run_benchmark(args) -> None:
                 )
                 for k, m in enumerate(ens.ensemble):
                     m.load_state_dict(state["weights"][k] if "weights" in state else state[k])
-                # Restore normalization stats if present (new format)
+                # Input normalization stats, if stored.
                 if state.get("norm_mean") is not None:
                     ens.input_mean = state["norm_mean"]
                     ens.input_std  = state["norm_std"]
                     print(f"[BENCH] Ensemble norm stats loaded", flush=True)
+                # Per-dimension delta scale, if stored, so the cached ensemble keeps
+                # the metric its calibrator was fitted on.
+                if state.get("delta_scale") is not None:
+                    ens.delta_scale = np.asarray(state["delta_scale"], np.float32)
+                    ens.scale_aware_uncertainty = bool(args.uncertainty_scale_aware)
                 print(f"[BENCH] Loaded ensemble: K={ckpt_K} hidden={ckpt_hidden}", flush=True)
             else:
                 print(f"[BENCH] Training ensemble on {len(D_train['obs'])} transitions "
@@ -1666,6 +1703,8 @@ def run_benchmark(args) -> None:
                     bootstrap=bool(args.ensemble_bootstrap),
                     ensemble_size=int(args.ensemble_size),
                     hidden_dims=ensemble_hidden,
+                    target_normalize=bool(args.ensemble_target_normalize),
+                    scale_aware_uncertainty=bool(args.uncertainty_scale_aware),
                 )
                 ensure_dir(outdir)
                 save_state = {
@@ -1674,8 +1713,24 @@ def run_benchmark(args) -> None:
                     "norm_std":  ens.input_std,
                     "hidden_dims": list(ensemble_hidden),
                     "ensemble_size": int(args.ensemble_size),
+                    "delta_scale": getattr(ens, "delta_scale", None),
                 }
                 torch.save(save_state, ens_path)
+
+            # With scale-aware uncertainty the calibrator bounds disagreement divided
+            # by the per-dimension delta scale; without that scale the gate would
+            # score a different statistic, so the run stops here.
+            if bool(args.uncertainty_scale_aware) and getattr(ens, "delta_scale", None) is None:
+                raise RuntimeError(
+                    "--uncertainty_scale_aware was requested but the ensemble "
+                    "carries no delta_scale (a cached checkpoint predating the "
+                    "scale-aware path?). Rerun with --force_retrain rather than "
+                    "gating on the unscaled statistic."
+                )
+            print(f"[BENCH] Gate statistic: "
+                  f"{'scale-aware USAD' if bool(args.uncertainty_scale_aware) else 'USAD'}"
+                  f" (delta_scale {'present' if getattr(ens, 'delta_scale', None) is not None else 'absent'})",
+                  flush=True)
 
             # ── Calibrator (USAD) ─────────────────────────────────────────
             cal_path = os.path.join(outdir, "calibrator_usad.pkl")
@@ -1683,7 +1738,7 @@ def run_benchmark(args) -> None:
                 with open(cal_path, "rb") as f:
                     calibrator, eps = pickle.load(f)
                 print(f"[BENCH] Loaded USAD calibrator (eps={eps:.4f})", flush=True)
-                # Re-apply Wilks check on cached calibrator (uses saved u_cal if available)
+                # Re-check the Wilks and min-bins conditions on the saved u_cal.
                 npz_path = os.path.join(outdir, "calibration_data_usad.npz")
                 if os.path.exists(npz_path) and np.isfinite(eps):
                     u_cal_saved = np.load(npz_path)["u"]
@@ -1694,10 +1749,9 @@ def run_benchmark(args) -> None:
                     if not wilks_ok:
                         print(
                             f"[CALIB] Wilks FAIL (post-load): n_b_min={n_b_min} < {wilks_thr} "
-                            f"-> eps=-inf (conservative collapse, Prop. 2)",
+                            f"-> eps=-inf (conservative collapse)",
                             flush=True,
                         )
-                    # min_bins check on cached calibrator
                     _bins_cached = len(calibrator.bin_bounds)
                     _min_bin_cached = wilks_min_n_per_bin(_bins_cached, float(args.calib_delta))
                     eps = calib_min_bins_check(
@@ -1711,23 +1765,15 @@ def run_benchmark(args) -> None:
             else:
                 _delta = float(args.calib_delta)
                 _n_cal = len(D_calib["obs"])
-                # Under the triple-split pipeline the per-bin Wilks bound is
-                # computed on D_wilks ≈ N_cal/3, not on the full calibration
-                # set. Sizing B and min_bin_size against the effective sample
-                # keeps every quantity (n_bins_req, Bonferroni α/B, per-bin
-                # threshold) consistent with the subset actually used to fit
-                # the bound, so the Eq. (eq:bfun) coverage guarantee holds
-                # natively without runtime bin merging.
+                # With the triple split the per-bin bounds are fitted on
+                # D_wilks, about N_cal / 3 samples.
                 _n_fit = (_n_cal // 3) if int(args.calib_triple_split) else _n_cal
-                # B is selected via the candidate sweep + one-SE rule inside
-                # fit_calibrator. Set cfg.n_bins = 0 when --calib_bins=0 so the
-                # orchestration picks the theory default doubling sequence
-                # (or the explicit --calib_candidate_bins). A non-zero
-                # --calib_bins is treated as a legacy single-B override.
+                # fit_calibrator selects B over the candidate set with the
+                # one-standard-error rule. --calib_bins 0 uses the default set (or
+                # --calib_candidate_bins); a positive value fixes a single B.
                 _bins = int(args.calib_bins)
-                # _min_bin used only for the legacy single-split fallback path.
-                # In the triple-split + candidate-sweep path the min_bin_size is
-                # set to 1 inside fit_with_selection (no merging).
+                # min_bin_size applies to the single-split path only;
+                # fit_with_selection uses 1 (no bin merging).
                 _min_bin = (
                     wilks_min_n_per_bin(_bins, _delta)
                     if int(args.calib_min_samples) == 0
@@ -1752,11 +1798,9 @@ def run_benchmark(args) -> None:
                     random_seed=int(seed),
                     legacy_mode=bool(int(args.calib_legacy_mode)),
                 )
-                # Use the actually-selected B_dagger (= n_bins of the returned
-                # calibrator) for the legacy diagnostic check. With the new
-                # candidate-sweep path, conservative collapse is already encoded
-                # in eps_raw_usad (-inf when admissible set is empty), so this
-                # check is only a redundant sanity print.
+                # Min-bins check on the selected B_dagger. With candidate selection
+                # the collapse is already in eps_raw_usad (-inf when no candidate
+                # is admissible); the check then only prints the summary.
                 _bins_eff = int(getattr(calibrator, "meta", {}).get("B_dagger", len(calibrator.bin_bounds)) or len(calibrator.bin_bounds))
                 eps = calib_min_bins_check(
                     n_cal=_n_cal, delta=_delta, bins=_bins_eff, min_bin=_min_bin,
@@ -1778,7 +1822,7 @@ def run_benchmark(args) -> None:
                 with open(cal_var_path, "rb") as f:
                     calibrator_var, eps_var = pickle.load(f)
                 print(f"[BENCH] Loaded epistemic calibrator (eps_var={eps_var:.4f})", flush=True)
-                # Re-apply Wilks check on cached epistemic calibrator
+                # Re-check the Wilks and min-bins conditions on the saved u_cal.
                 npz_var_path = os.path.join(outdir, "calibration_data_epistemic.npz")
                 if os.path.exists(npz_var_path) and np.isfinite(eps_var):
                     u_cal_var_saved = np.load(npz_var_path)["u"]
@@ -1789,10 +1833,9 @@ def run_benchmark(args) -> None:
                     if not wilks_ok_v:
                         print(
                             f"[CALIB] Wilks FAIL (post-load epistemic): n_b_min={n_b_min_v} < {wilks_thr_v} "
-                            f"-> eps_var=-inf (conservative collapse, Prop. 2)",
+                            f"-> eps_var=-inf (conservative collapse)",
                             flush=True,
                         )
-                    # min_bins check on cached epistemic calibrator
                     _bins_cached_v = len(calibrator_var.bin_bounds)
                     _min_bin_cached_v = wilks_min_n_per_bin(_bins_cached_v, float(args.calib_delta))
                     eps_var = calib_min_bins_check(
@@ -1806,12 +1849,8 @@ def run_benchmark(args) -> None:
             else:
                 _delta_v = float(args.calib_delta)
                 _n_cal_v = len(D_calib["obs"])
-                # See USAD branch above: size B on the effective per-bin
-                # sample (D_wilks ≈ N_cal/3 under the triple-split pipeline).
+                # Same B selection and bin sizing as the USAD branch.
                 _n_fit_v = (_n_cal_v // 3) if int(args.calib_triple_split) else _n_cal_v
-                # See USAD branch above: B is selected via the candidate sweep
-                # in fit_calibrator. Pass cfg.n_bins = args.calib_bins (0 triggers
-                # theory default; non-zero is a legacy single-B override).
                 _bins_v = int(args.calib_bins)
                 _min_bin_v = (
                     wilks_min_n_per_bin(_bins_v, _delta_v)
@@ -1854,7 +1893,7 @@ def run_benchmark(args) -> None:
 
             # ── Config for model env / MCTS ───────────────────────────────
             model_cfg_mcts = ModelContinuousEnvConfig.for_domain(args.domain)
-            model_cfg_mcts.truncate_on_time_limit = False  # depth-limited for MCTS
+            model_cfg_mcts.truncate_on_time_limit = False  # rollouts end at max_depth
             model_cfg_mcts.max_steps = int(args.max_depth)
 
             mcts_cfg = OfflineMCTSConfig(
@@ -1879,6 +1918,7 @@ def run_benchmark(args) -> None:
                       f"{list(completed_methods.keys())}", flush=True)
 
             def row_base(eps_used: Optional[float] = None):
+                """Fields shared by every result row of this cell."""
                 return {
                     "domain": args.domain,
                     "seed": seed,
@@ -1894,17 +1934,15 @@ def run_benchmark(args) -> None:
                 eps_used: Optional[float] = None,
                 planner_obj: Optional[Any] = None,
             ) -> None:
+                """Evaluate act_fn as method_name unless skipped or already completed."""
                 if method_name not in should_run:
                     return
-                # Skip if already fully completed
                 if method_name in completed_methods:
                     print(f"[CKPT] {method_name} already done — loading from checkpoint", flush=True)
                     rows.append(completed_methods[method_name])
                     return
                 print(f"[BENCH] Evaluating {method_name}...", flush=True)
-                # Reset CSPI stats counters so the JSONL row reflects this
-                # evaluation only (the planner object is reused across
-                # datasets/seeds/backends in some code paths).
+                # Reset the switch statistics so the row covers this evaluation only.
                 if planner_obj is not None and hasattr(planner_obj, "cspi_reset_stats"):
                     planner_obj.cspi_reset_stats()
                 ckpt = _EpisodeCheckpoint(outdir, method_name)
@@ -1917,6 +1955,7 @@ def run_benchmark(args) -> None:
                     ckpt=ckpt,
                     env_factory=_eval_env_factory,
                     n_workers=int(args.eval_workers),
+                    seed_stride=int(getattr(args, 'eval_seed_stride', 1)),
                 )
                 row = {**row_base(eps_used), "method": method_name, **metrics}
                 if planner_obj is not None and hasattr(planner_obj, "cspi_stats"):
@@ -1952,15 +1991,9 @@ def run_benchmark(args) -> None:
             # ── PPO baseline ──────────────────────────────────────────────
             run_eval("ppo_only", ppo_act_fn)
 
-            # ── Cal-SPI (deployed conservative CSPI policy) ──────────────────
-            # The deployed Cal-SPI policy used in all paper experiments is
-            # the conservative variant of Theorem `thm:cspi`: it inserts the
-            # baseline action a_b at the root, runs the calibrated MCTS
-            # search, and switches away from a_b only when the safety margin
-            #     Q_hat_safe(a*) - V_hat_b(s_root) >= Delta_margin
-            # is satisfied AND a_b itself is gate-certified. Otherwise it
-            # falls back to a_b. There is no separate "unconditional" Cal-SPI
-            # method registered for paper runs.
+            # ── Cal-SPI (calibrated USAD) ─────────────────────────────────
+            # Switches from the baseline action a_b to a* only when a_b is
+            # gate-certified and Q_hat_safe(a*) - V_hat_b(s_root) >= Delta_margin.
             if "calibrated_usad" in should_run:
                 import copy
                 mcts_cal = make_mcts_calibrated(
@@ -2003,12 +2036,10 @@ def run_benchmark(args) -> None:
                 """Train (or load from cache) a baseline agent and evaluate it."""
                 if method_name not in should_run:
                     return
-                # Skip if already fully completed
                 if method_name in completed_methods:
                     print(f"[CKPT] {method_name} already done — loading from checkpoint", flush=True)
                     rows.append(completed_methods[method_name])
                     return
-                # Try to load trained model (skip training if model cache hit)
                 if not _load_baseline_model(outdir, method_name, agent):
                     print(f"[BENCH] Training baseline {method_name} ({baseline_epochs} steps)...",
                           flush=True)
@@ -2027,6 +2058,7 @@ def run_benchmark(args) -> None:
                     ckpt=ckpt,
                     env_factory=_eval_env_factory,
                     n_workers=int(args.eval_workers),
+                    seed_stride=int(getattr(args, 'eval_seed_stride', 1)),
                 )
                 row = {**row_base(), "method": method_name, **metrics}
                 rows.append(row)
@@ -2038,9 +2070,8 @@ def run_benchmark(args) -> None:
                     flush=True,
                 )
 
-            # Shared dataset format expected by all baseline agents.
-            # obs_desired_goal / next_desired_goal: shape (N, 0) so that IQL/TD3BC
-            # _dataset_to_tensors concatenates nothing (flat env, no goal dims).
+            # Dataset format shared by the baseline agents. The goal arrays have
+            # shape (N, 0), so concatenating them to the observation is a no-op.
             _n = len(D_train["obs"])
             _goal_zeros = np.zeros((_n, 0), dtype=np.float32)
             _baseline_ds = {
@@ -2053,7 +2084,7 @@ def run_benchmark(args) -> None:
                 "done":             D_train["dones"].astype(np.float32),
             }
 
-            _rb = min(1000, len(D_train["obs"]))  # rollout batch
+            _rb = min(1000, len(D_train["obs"]))  # model rollout batch size
 
             # IQL
             if "iql" in should_run:
@@ -2098,11 +2129,14 @@ def run_benchmark(args) -> None:
                 cal_ql_agent = CalQLAgent(obs_dim, act_dim, cfg=make_cal_ql_cfg(args.domain, seed))
                 run_baseline("cal_ql", cal_ql_agent, cal_ql_agent.act)
 
-            # ── MCTS no gate (last: ablation reference, after all safe methods) ──
+            # ── MCTS without gate (reference planner) ─────────────────────
             if "mcts_only_no_gate" in should_run:
                 import copy
                 mcts_cfg_nogate = copy.copy(mcts_cfg)
-                mcts_cfg_nogate.num_sims = min(200, int(mcts_cfg.num_sims))
+                # Budget: --nogate_num_sims if positive, else min(200, num_sims).
+                _ng = int(getattr(args, 'nogate_num_sims', 0))
+                mcts_cfg_nogate.num_sims = (_ng if _ng > 0
+                                            else min(200, int(mcts_cfg.num_sims)))
                 mcts_no_gate = make_mcts_no_gate(ens, ppo, copy.copy(model_cfg_mcts), mcts_cfg_nogate, seed)
                 run_eval("mcts_only_no_gate", mcts_no_gate.act)
 
@@ -2125,12 +2159,13 @@ def run_benchmark(args) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Cal-SPI benchmark for Walker2d/Hopper")
+    """Parse the command-line arguments."""
+    ap = argparse.ArgumentParser(description="Cal-SPI benchmark on MuJoCo locomotion domains")
 
     # Domain
     ap.add_argument("--domain", type=str, required=True,
-                    choices=["walker2d", "hopper", "halfcheetah", "reacher", "swimmer"],
-                    help="Locomotion / reaching domain")
+                    choices=sorted(DOMAIN_CONFIGS),
+                    help="MuJoCo domain")
 
     # Output
     ap.add_argument("--outdir", type=str, default="results_continuous",
@@ -2140,61 +2175,65 @@ def parse_args():
     ap.add_argument("--ppo_global_path", type=str, required=True,
                     help="Path to pre-trained PPO checkpoint (.zip)")
     ap.add_argument("--ppo_timesteps", type=int, default=70_000,
-                    help="PPO training timesteps if checkpoint missing "
-                         "(default 70k matches the paper Hopper setup; "
-                         "HalfCheetah uses 200k, set via --ppo_timesteps).")
+                    help="PPO training timesteps if the checkpoint is missing")
 
-    # Dataset (Hopper-paper defaults; HalfCheetah launcher overrides)
+    # Dataset
     ap.add_argument("--dataset_trajs", type=int, nargs="+", default=[5, 50, 500, 1000])
     ap.add_argument("--seeds",          type=int, nargs="+", default=[0, 1, 2, 3, 4])
     ap.add_argument("--max_steps",      type=int, default=1000,
                     help="Max steps per episode")
 
-    # MCTS (Hopper-paper defaults; HalfCheetah launcher overrides)
+    # MCTS and evaluation
     ap.add_argument("--num_sims",  type=int,   default=1000)
     ap.add_argument("--max_depth", type=int,   default=10)
     ap.add_argument("--gamma",     type=float, default=0.99)
     ap.add_argument("--eval_episodes", type=int, default=20)
-    ap.add_argument("--mcts_backend", type=str, default="numba",
-                    choices=["original", "batched", "numba"],
-                    help="MCTS planner backend: 'original' (per-sample torch ensemble "
-                         "forward), 'batched' (per-node batched torch forward, byte-exact "
-                         "under fixed_per_sim sampling), or 'numba' (njit-accelerated "
-                         "ensemble+PPO forward, ~17x faster at paper-grade settings on "
-                         "Hopper; algorithmically identical, float32-rounding close). "
-                         "Default 'numba' matches the paper configuration.")
+    ap.add_argument("--eval_seed_stride", type=int, default=1,
+                    help="Environment seed of episode i is seed*stride + i. With 1, "
+                         "adjacent seeds share most initial states; a value >= "
+                         "--eval_episodes gives every cell a disjoint range. All methods "
+                         "of a cell see the same initial states.")
+    ap.add_argument("--mcts_backend", type=str, default="array",
+                    choices=["original", "batched", "numba", "numba_scaled", "array"],
+                    help="MCTS planner backend: 'original' (per-sample torch forward), "
+                         "'batched' (per-node batched torch forward, same actions as "
+                         "'original' under fixed_per_sim sampling), 'numba' (compiled "
+                         "ensemble and PPO forward; same algorithm, equal up to float32 "
+                         "rounding), 'numba_scaled' (numba with the scale-aware gate), "
+                         "'array' (compiled search over preallocated buffers, same "
+                         "actions as 'numba').")
     ap.add_argument("--eval_workers", type=int, default=1,
-                    help="Parallel workers for episodic eval (fork-based). "
-                         "Default 1 = sequential. Set >1 to parallelize eval_episodes "
-                         "within a single (seed, ds) job.")
+                    help="Fork-based workers for episodic evaluation (1 = sequential)")
 
     # Calibration
     ap.add_argument("--calib_frac",        type=float, default=0.2)
     ap.add_argument("--calib_bins",        type=int,   default=0,
-                    help="Legacy single-B override (0 = use --calib_candidate_bins / theory default)")
+                    help="Fixed bin count B (0 = select B from --calib_candidate_bins "
+                         "or the default set)")
     ap.add_argument("--calib_candidate_bins", type=str, default="",
                     help=(
-                        "Candidate set for one-SE bin selection (comma-separated, e.g. '20,40,80'). "
-                        "Empty = theory default doubling [B_min, 2 B_min, 4 B_min, 8 B_min, 16 B_min] "
-                        "with B_min=ceil(1/(1-q_eps)). Bonferroni alpha_eff = alpha/(|cand|*B)."
+                        "Candidate bin counts for one-standard-error selection, comma-separated "
+                        "(e.g. '20,40,80'). Empty = [B_min, 2 B_min, 3 B_min, 4 B_min] with "
+                        "B_min=ceil(1/(1-q_eps)). Per-bin confidence alpha_eff = alpha/(|cand|*B)."
                     ))
     ap.add_argument("--calib_n_bootstrap", type=int, default=200,
-                    help="Bootstrap resamples for SE of eps_B (one-SE rule). 0 disables (recovers argmin).")
+                    help="Bootstrap resamples for the standard error of eps_B in the "
+                         "one-standard-error rule (0 = plain argmin).")
     ap.add_argument("--calib_legacy_mode", type=int, default=0,
-                    help="Legacy reproducibility flag (0=new candidate sweep + one-SE + Wilks-strict; "
-                         "1=old single-B path: B=wilks_optimal_bins(N_fit), mode='quantile', "
-                         "alpha_eff=alpha/B, no Bonferroni over candidates). For comparing pre-refactor results.")
+                    help="0 = candidate selection with the one-standard-error rule; "
+                         "1 = single B = wilks_optimal_bins(|D_wilks|), mode='quantile', "
+                         "alpha_eff=alpha/B, no correction over candidates.")
     ap.add_argument("--calib_delta",       type=float, default=0.05)
     ap.add_argument("--calib_min_samples", type=int,   default=0,
-                    help="Min samples per bin / min_bin_size (0 = Wilks n_b for chosen B)")
+                    help="min_bin_size of the single-split fit (0 = Wilks n_b for the chosen B)")
     ap.add_argument("--q_eps",             type=float, default=0.95,
                     help=(
-                        "Quantile level for eps threshold: eps=quantile_{q_eps}(B(u_calib)). "
+                        "Quantile level of the gate threshold: eps=quantile_{q_eps}(B(u_calib)). "
                         "Also sets B_min=ceil(1/(1-q_eps)) for the candidate set "
-                        "(q_eps=0.95 → B_min=20, paper eq. bmin)."
+                        "(q_eps=0.95 gives B_min=20)."
                     ))
 
-    # Baselines (paper Hopper: 1,000,000 SAC/IQL/etc. updates per agent)
+    # Offline RL baselines: gradient updates per agent
     ap.add_argument("--baseline_epochs", type=int, default=1_000_000)
 
     # Methods to run
@@ -2203,105 +2242,96 @@ def parse_args():
         default=["ppo_only", "mcts_only_no_gate", "calibrated_usad"],
         help="Methods to evaluate",
     )
+    ap.add_argument("--nogate_num_sims", type=int, default=0,
+                    help="Simulation budget for mcts_only_no_gate "
+                         "(0 = min(200, num_sims)).")
 
     # Misc
     ap.add_argument("--force_retrain", action="store_true",
                     help="Retrain ensemble/calibrator even if cached")
     # ── MCTS / APW hyperparameters ─────────────────────────────────────────
     ap.add_argument("--dpw_k",            type=float, default=2.0,
-                    help="APW widening constant k: max_children=floor(k*N^alpha). "
-                         "k=2 → 28 root actions at 200 sims (recommended). "
-                         "k=1 (original) → only 14.")
+                    help="APW widening constant k: max_children=floor(k*N^alpha)")
     ap.add_argument("--dpw_alpha",        type=float, default=0.5,
-                    help="APW exponent alpha (default=0.5, standard DPW)")
+                    help="APW exponent alpha")
     ap.add_argument("--c_puct",           type=float, default=1.5,
-                    help="PUCT exploration constant (default=1.5)")
+                    help="PUCT exploration constant")
     ap.add_argument("--n_actions_root",   type=int,   default=96,
-                    help="Hard cap on actions expanded at root "
-                         "(default 96 = paper Hopper; HalfCheetah uses 200).")
+                    help="Maximum number of actions at the root")
     ap.add_argument("--ppo_std_scale",    type=float, default=0.1,
-                    help="Std of Gaussian sampling around PPO mean for new actions.")
+                    help="Std of the Gaussian around the PPO mean from which new actions "
+                         "are sampled")
     ap.add_argument("--n_actions_per_node", type=int, default=24,
-                    help="Hard cap on actions at non-root nodes "
-                         "(default 24 = paper Hopper / HalfCheetah).")
+                    help="Maximum number of actions at non-root nodes")
     ap.add_argument("--ensemble_epochs",    type=int,  default=200,
-                    help="Ensemble training epochs (MOReL/MOPO use 200-2000; default=200)")
-    # CSPI hyperparameters for the deployed conservative Cal-SPI policy
+                    help="Ensemble training epochs")
+    # Baseline-relative switch
     ap.add_argument("--cspi_margin_mult", type=float, default=1.0,
-                    help="Scalar multiplier on Delta_margin in the conservative "
-                         "Cal-SPI policy (set to 0 only as a sanity-check knob to "
-                         "recover the unconditional argmax; not for paper runs).")
+                    help="Multiplier on Delta_margin in the baseline-relative switch "
+                         "(0 = plain argmax over A_safe).")
     ap.add_argument("--cspi_v_rollout_horizon", type=int, default=0,
-                    help="Number of model-env steps used to estimate V_b(s_root) "
-                         "via a rollout of pi_b at the root. Set to 0 (paper "
-                         "default) to auto-match max_depth (V_b and Q_m "
-                         "accumulate reward over the same horizon).")
+                    help="Model steps of the pi_b rollout that estimates V_b(s_root) "
+                         "(0 = max_depth, the horizon of the Q estimates).")
     ap.add_argument("--cspi_v_rollout_n_samples", type=int, default=1,
-                    help="Number of independent pi_b rollouts averaged to "
-                         "estimate V_b(s_root). Larger values reduce variance "
-                         "from stochastic ensemble sampling.")
+                    help="Number of pi_b rollouts averaged to estimate V_b(s_root)")
     ap.add_argument("--cspi_e_plan_scale", type=float, default=0.5,
-                    help="E_plan coefficient as a fraction of the model-error "
-                         "radius in the safety margin (heuristic upper bound on "
-                         "the MCTS finite-budget estimation error).")
+                    help="E_plan term of the margin, as a fraction of the model-error "
+                         "radius (heuristic bound on the finite-budget planning error).")
     ap.add_argument("--cspi_delta_piB", type=float, default=0.0,
-                    help="Additive slack delta_piB in the safety margin, "
-                         "accounting for deviation of pi_b from optimality. "
-                         "0.0 corresponds to the near-optimal baseline assumption.")
+                    help="Additive slack delta_piB in the margin for the suboptimality "
+                         "of pi_b (0 = near-optimal baseline assumption).")
     ap.add_argument("--cspi_frozen_root", type=int, default=1,
-                    help="Freeze the root candidate set before the MCTS "
-                         "simulation loop (1=on, 0=off). When on, the `K = "
-                         "n_actions_root` candidates (including a_b) are "
-                         "sampled once via APW at the start of act(), the "
-                         "safe subset is frozen, and no new root actions are "
-                         "added during the search. Required by the "
-                         "finite-budget planner bound in Theorem~thm:convergence.")
+                    help="Frozen-root regime (1=on, 0=off): the n_actions_root root "
+                         "candidates, a_b included, are sampled once at the start of "
+                         "act(), their safe subset is fixed, and no root actions are "
+                         "added during search. The finite-budget planner bound assumes it.")
     ap.add_argument("--cspi_n_min_root_visits", type=int, default=3,
-                    help="Minimum guaranteed visits per safe root action "
-                         "before PUCT is allowed to drop it. Only used when "
-                         "cspi_frozen_root=1.")
+                    help="Minimum visits per safe root action before PUCT selection "
+                         "applies (frozen-root regime only).")
     ap.add_argument("--use_ppo_leaf_value", type=int, default=0,
-                    help="0 (default): leaf value = 0 (paper canonical). "
-                         "1: bootstrap leaf value with V_PPO(s_leaf), giving "
-                         "MCTS lookahead beyond max_depth.")
+                    help="0: leaf value 0. 1: bootstrap the leaf with V_PPO(s_leaf).")
     ap.add_argument("--calibrator_mode", type=str, default="quantile",
                     choices=["quantile", "wilks_strict"],
-                    help="Per-bin bound construction: 'quantile' = empirical (1-delta)-quantile "
-                         "(backward-compatible default); 'wilks_strict' = order-statistic upper "
-                         "tolerance limit with per-bin Bonferroni confidence 1-alpha/B "
-                         "(strictly stronger guarantee, numerically equivalent gate decisions "
-                         "in our operational regime).")
+                    help="Per-bin bound: 'quantile' = empirical (1-delta)-quantile; "
+                         "'wilks_strict' = order-statistic upper tolerance limit with "
+                         "per-bin confidence 1-alpha/B.")
     ap.add_argument("--calibrator_alpha", type=float, default=0.05,
-                    help="Overall Wilks confidence (only used when calibrator_mode=wilks_strict); "
-                         "per-bin confidence is alpha/B after Bonferroni allocation")
+                    help="Overall Wilks confidence level alpha for wilks_strict; "
+                         "split as alpha/B across bins")
     ap.add_argument("--calib_triple_split", type=int, default=1,
                     choices=[0, 1],
-                    help="Partition the calibration sample into three disjoint "
-                         "blocks D_bin/D_wilks/D_thr and fit bin edges, per-bin "
-                         "Wilks bounds, and the threshold eps on independent "
-                         "subsets (1, default: matches the coverage proof of the "
-                         "main paper). 0 = legacy joint single-split fit on the "
-                         "full calibration sample, reproducing the pre-triple-"
-                         "split cached calibrators without the formal Wilks guarantee.")
+                    help="1: fit bin edges, per-bin Wilks bounds and eps on the disjoint "
+                         "blocks D_bin/D_wilks/D_thr, as the coverage guarantee requires. "
+                         "0: fit all three on the full calibration sample.")
     ap.add_argument("--ensemble_normalize", type=int,  default=0,
-                    help="Normalize (s,a) inputs to zero-mean unit-var "
-                         "(MOReL/MOPO practice). Default 0 matches the paper "
-                         "Cal-SPI configuration; pass 1 to enable.")
+                    help="Standardize (s,a) inputs of the ensemble (1=on)")
     ap.add_argument("--ensemble_bootstrap", type=int,  default=0,
-                    help="Per-member bootstrap resample for diversity. "
-                         "Default 0 matches the paper Cal-SPI configuration; "
-                         "pass 1 to enable.")
+                    help="Train each ensemble member on a bootstrap resample (1=on)")
+    ap.add_argument("--uncertainty_scale_aware", type=int, default=0,
+                    choices=[0, 1],
+                    help="Divide USAD and the calibration error by the per-dimension "
+                         "delta scale, so every state component weighs equally in the "
+                         "calibrated bound. eps is then in scaled units.")
+    ap.add_argument("--ensemble_target_normalize", type=int, default=0,
+                    choices=[0, 1],
+                    help="Standardize the regression target per dimension during "
+                         "ensemble training; the de-normalization is folded into the "
+                         "output layer, so the model still predicts raw deltas.")
     ap.add_argument("--ensemble_size",      type=int,  default=4,
-                    help="Number of ensemble members K (default=4 — Hopper/PointMaze "
-                         "canonical; MOPO uses K=7)")
+                    help="Number of ensemble members K")
     ap.add_argument("--ensemble_hidden_dims", type=str, default="512,512",
-                    help="Comma-separated hidden layer sizes for each ensemble "
-                         "member (default=512,512 — Hopper/PointMaze canonical; "
-                         "MOPO/MOReL use 200,200,200,200)")
+                    help="Comma-separated hidden layer sizes of each ensemble member")
 
     return ap.parse_args()
 
 
+def _log_config(args) -> None:
+    """Print every argument as a sorted key=value list on one [CONFIG] line."""
+    print("[CONFIG] " + " ".join(
+        f"{k}={v}" for k, v in sorted(vars(args).items())), flush=True)
+
+
 if __name__ == "__main__":
     args = parse_args()
+    _log_config(args)
     run_benchmark(args)

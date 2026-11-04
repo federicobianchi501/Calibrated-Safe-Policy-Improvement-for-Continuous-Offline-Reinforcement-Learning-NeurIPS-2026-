@@ -1,28 +1,31 @@
 #!/bin/bash
-# Reproduce the Point Maze experiments from the paper.
+# =============================================================================
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
+# =============================================================================
+# Reproduce the Point Maze experiments (PointMaze_UMazeDense-v3).
 #
-# Configuration follows Tables 5, 6, 7 of the paper:
-#   - 4 dataset sizes:      |D| in {1, 5, 250, 500} trajectories
-#   - 5 random seeds:       {0, 1, 2, 3, 4}
-#   - 10 eval episodes/seed, max 300 steps per episode
-#   - methods evaluated:    ppo_only, calibrated_usad, mcts_only_no_gate,
-#                           iql, td3bc, morel_full, mopo_mse, cql, bear, cal_ql
-#   - calibration:          triple-split, candidate bins {20,40,60,80},
-#                           q_des=0.95, alpha=0.05, delta=0.05
-#   - planner (MCTS-DPW):   M_sim=200 simulations, planning horizon H=20,
-#                           DPW kappa=2.0, alpha_pw=0.5, K_root=64, K_node=16,
-#                           c_puct=1.5, action-sampling sigma=0.1
-#   - PPO behavior policy:  [32,32] actor-critic, 50k training timesteps
+# Configuration (Tables 17-19 of the paper):
+#   - dataset sizes:      |D| in {1, 5, 250, 500} trajectories
+#   - seeds:              {0, 1, 2, 3, 4}
+#   - eval episodes:      40 per seed, at most 300 steps each
+#   - methods:            ppo_only, calibrated_usad, mcts_only_no_gate,
+#                         iql, td3bc, morel_full, mopo_mse, cql, bear, cal_ql
+#   - calibration:        triple split, candidate bins {20,40,60,80},
+#                         q_des=0.95, alpha=0.05, delta=0.05
+#   - planner:            M_sim=200, H=20, kappa=2.0, alpha_pw=0.5,
+#                         K_root=64, K_node=16, c_puct=1.5, sigma=0.1
+#   - ensemble:           K=4, MLP [512,512], MSE, 50 epochs
+#   - PPO baseline:       [32,32], 40k timesteps (models/ppo_pointmaze.zip)
 #
-# Each (ds, seed) cell trains a fresh ensemble + calibrator from the offline
-# dataset, then evaluates the three methods on the true environment with the
-# trained PPO baseline policy.
+# Each (ds, seed) cell collects its dataset, trains the ensemble and the
+# calibrator, and evaluates the methods on the true environment.
+# Output per cell: $OUT_ROOT/ds<DS>/seed<S>/
+# The aggregator then writes $OUT_ROOT/aggregated/.
 #
-# Outputs (per cell): results_pointmaze/ds<DS>/seed<S>/{cache, ep_ckpt,
-# results.csv, results_partial.jsonl, traj_debug}
-#
-# After all cells finish, the launcher invokes the aggregator to produce
-# results_pointmaze/aggregated/aggregated_results_absolute.csv and SVG plots.
+# Overrides: DATASET_SIZES_OVERRIDE, SEEDS_OVERRIDE, RUN_METHODS, MAX_JOBS,
+# MCTS_BACKEND (array | parametric), PYTHON.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -36,7 +39,7 @@ PPO_PATH="${PPO_PATH:-models/ppo_pointmaze.zip}"
 DATASET_SIZES=(${DATASET_SIZES_OVERRIDE:-1 5 250 500})
 SEEDS=(${SEEDS_OVERRIDE:-0 1 2 3 4})
 
-# Methods evaluated in the main paper figure + offline-RL baselines.
+# Cal-SPI, ungated MCTS-DPW, PPO and the offline RL baselines.
 # Override with RUN_METHODS env var to restrict to a subset, e.g.:
 #   RUN_METHODS="ppo_only calibrated_usad mcts_only_no_gate" bash run_benchmark_pointmaze.sh
 RUN_METHODS="${RUN_METHODS:-ppo_only calibrated_usad mcts_only_no_gate iql td3bc morel_full mopo_mse cql bear cal_ql}"
@@ -47,8 +50,9 @@ BASELINE_EPOCHS="${BASELINE_EPOCHS:-100000}"
 
 # Parallelism: maximum number of concurrent (ds, seed) cells
 MAX_JOBS="${MAX_JOBS:-10}"
+MCTS_BACKEND="${MCTS_BACKEND:-array}"
 
-# Reward and environment configuration (matches the paper PointMaze setup)
+# Reward and environment configuration
 REWARD_TYPE="dense"
 REWARD_MODE="speed_distance"
 STEP_PENALTY=1.0
@@ -56,13 +60,13 @@ DIST_PENALTY=0.2
 SUCCESS_BONUS=1500.0
 LIVING_COST=0.0
 CONTINUING_TASK=0
-PPO_TIMESTEPS=50000
+PPO_TIMESTEPS=40000
 
-# Planner and calibration hyperparameters (Table 5/6 of the paper)
+# Planner and calibration hyperparameters
 NUM_SIMS=200
 MAX_DEPTH=20
 GAMMA=0.99
-EVAL_EPISODES=10
+EVAL_EPISODES=40
 MAX_STEPS=300
 DPW_K=2.0
 DPW_ALPHA=0.5
@@ -117,6 +121,7 @@ run_job() {
         --calib_delta "$CALIB_DELTA" --calib_min_samples "$CALIB_MIN_SAMPLES" \
         --eps_from_calibration 1 --eps_quantile "$EPS_QUANTILE" --tau "$TAU" \
         --eval_episodes "$EVAL_EPISODES" --max_steps "$MAX_STEPS" \
+        --mcts_backend "$MCTS_BACKEND" \
         --run_methods $RUN_METHODS \
         --save_trajs_for_ds 1 5 250 500 --traj_eval_episodes 3 \
         --load_from_cache 0 \
@@ -134,13 +139,13 @@ export LIVING_COST CONTINUING_TASK PPO_TIMESTEPS
 export NUM_SIMS MAX_DEPTH GAMMA EVAL_EPISODES MAX_STEPS
 export DPW_K DPW_ALPHA C_PUCT N_ACTIONS_ROOT N_ACTIONS_PER_NODE PPO_STD_SCALE
 export CALIB_FRAC CALIB_BINS CALIB_DELTA CALIB_MIN_SAMPLES
-export EPS_QUANTILE TAU RUN_METHODS BASELINE_EPOCHS
+export EPS_QUANTILE TAU RUN_METHODS BASELINE_EPOCHS MCTS_BACKEND
 
 JOBS=()
 for DS in "${DATASET_SIZES[@]}"; do
     for SEED in "${SEEDS[@]}"; do JOBS+=("$SEED $DS"); done
 done
-echo "[LAUNCHER] PointMaze: ${#JOBS[@]} jobs, MAX_JOBS=$MAX_JOBS"
+echo "[LAUNCHER] PointMaze: ${#JOBS[@]} jobs, MAX_JOBS=$MAX_JOBS, backend=$MCTS_BACKEND"
 
 printf '%s\n' "${JOBS[@]}" | xargs -P "$MAX_JOBS" -I{} bash -c 'run_job $1 $2' _ {}
 

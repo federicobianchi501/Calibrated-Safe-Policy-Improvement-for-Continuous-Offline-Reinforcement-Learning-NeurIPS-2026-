@@ -1,14 +1,15 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-"""
-continuous_env_factory.py — Factory functions for Walker2d and Hopper.
+"""Factories and per-domain constants for the MuJoCo domains.
 
-Usage:
-    env = make_walker2d_env(seed=0)
-    env = make_hopper_env(seed=0)
-    env = make_continuous_env("walker2d", seed=0)
+Supported domains: walker2d, hopper, halfcheetah, ant (gymnasium v5 environments).
+`DOMAIN_CONFIGS` holds the observation indices and reward/termination constants that the
+learned model environment uses to recompute rewards and termination from flat observations.
+
+    env = make_continuous_env("halfcheetah", seed=0)
 """
 from typing import Optional
 
@@ -16,7 +17,7 @@ import gymnasium as gym
 
 from safe_rl.envs.continuous_env_wrapper import ContinuousEnvWrapper
 
-# Per-domain constants used by benchmark and model env
+# Per-domain constants shared by the benchmarks and the model environment.
 DOMAIN_CONFIGS = {
     "walker2d": {
         "env_id":           "Walker2d-v5",
@@ -51,8 +52,8 @@ DOMAIN_CONFIGS = {
         "obs_dim":          17,
         "act_dim":          6,
         "max_episode_steps": 1000,
-        # HalfCheetah reward = forward_reward_weight * x_vel - ctrl_cost_weight * ||a||^2.
-        # No healthy bonus, no termination on fall (the body cannot fall over).
+        # Reward = forward_reward_weight * x_vel - ctrl_cost_weight * ||a||^2.
+        # No healthy bonus and no termination.
         "vel_obs_idx":      8,          # obs[8] = qvel[0] = x_velocity
         "ctrl_cost_weight": 0.1,
         "healthy_reward":   0.0,
@@ -61,36 +62,30 @@ DOMAIN_CONFIGS = {
         "healthy_z_range":  (-float("inf"), float("inf")),  # always healthy
         "healthy_angle":    float("inf"),
     },
-    "reacher": {
-        "env_id":           "Reacher-v5",
-        "obs_dim":          10,
-        "act_dim":          2,
-        "max_episode_steps": 50,
-        # Reacher reward = -||fingertip - target||_2 - ctrl_cost_weight * ||a||^2
-        # The fingertip-target vector is obs[8:10] (2D since Reacher is planar).
-        # No locomotion semantics — vel/z/angle entries are placeholders.
-        "vel_obs_idx":      0,                # unused
-        "ctrl_cost_weight": 1.0,              # Reacher default
-        "healthy_reward":   0.0,
-        "z_obs_idx":        0,                # unused
-        "angle_obs_idx":    1,                # unused
-        "healthy_z_range":  (-float("inf"), float("inf")),
-        "healthy_angle":    float("inf"),
-    },
-    "swimmer": {
-        "env_id":           "Swimmer-v5",
-        "obs_dim":          8,
-        "act_dim":          2,
+    "ant": {
+        "env_id":           "Ant-v5",
+        "obs_dim":          27,
+        "act_dim":          8,
         "max_episode_steps": 1000,
-        # Swimmer reward = forward_reward_weight * x_vel - ctrl_cost_weight * ||a||^2.
-        # obs = qpos[2:] (3 angles) + qvel (5) → x_velocity = qvel[0] = obs[3].
-        # No fall termination, no health bonus.
-        "vel_obs_idx":      3,                # obs[3] = qvel[0] = x_velocity
-        "ctrl_cost_weight": 1e-4,             # Swimmer-v5 default
-        "healthy_reward":   0.0,
-        "z_obs_idx":        0,                # unused
+        # Reward = healthy_reward + x_vel - ctrl_cost_weight * ||a||^2 - contact_cost.
+        # The env_kwargs make the reward exactly reconstructible from the flat obs:
+        #   include_cfrc_ext_in_observation=False drops the 78 contact-force entries
+        #     (obs_dim = 27);
+        #   contact_cost_weight=0.0 removes the contact cost, which cannot be
+        #     recomputed from the remaining observation.
+        # obs = qpos[2:] (13) + qvel (14), so x_velocity = qvel[0] = obs[13].
+        # Termination: torso z outside [0.2, 1.0]. There is no scalar trunk angle in 3D,
+        # so the angle condition is disabled.
+        "env_kwargs": {
+            "include_cfrc_ext_in_observation": False,
+            "contact_cost_weight": 0.0,
+        },
+        "vel_obs_idx":      13,
+        "ctrl_cost_weight": 0.5,              # Ant-v5 default
+        "healthy_reward":   1.0,
+        "z_obs_idx":        0,                # obs[0] = qpos[2] = torso height
         "angle_obs_idx":    1,                # unused
-        "healthy_z_range":  (-float("inf"), float("inf")),
+        "healthy_z_range":  (0.2, 1.0),
         "healthy_angle":    float("inf"),
     },
 }
@@ -102,17 +97,17 @@ def make_continuous_env(
     *,
     max_episode_steps: Optional[int] = None,
 ) -> ContinuousEnvWrapper:
-    """
-    Create a ContinuousEnvWrapper for the given domain.
+    """Create a seeded ContinuousEnvWrapper for `domain`.
 
     Args:
-        domain: "walker2d" or "hopper"
-        seed: random seed for the environment
-        max_episode_steps: override default episode length if provided
+        domain: key of DOMAIN_CONFIGS (walker2d, hopper, halfcheetah, ant).
+        seed: seed for env reset and for the action/observation spaces.
+        max_episode_steps: episode length; defaults to the domain value.
     """
     cfg = DOMAIN_CONFIGS[domain]
     n_steps = max_episode_steps if max_episode_steps is not None else cfg["max_episode_steps"]
-    env = gym.make(cfg["env_id"], max_episode_steps=int(n_steps))
+    env = gym.make(cfg["env_id"], max_episode_steps=int(n_steps),
+                   **cfg.get("env_kwargs", {}))
     env.reset(seed=int(seed))
     env.action_space.seed(int(seed))
     env.observation_space.seed(int(seed))

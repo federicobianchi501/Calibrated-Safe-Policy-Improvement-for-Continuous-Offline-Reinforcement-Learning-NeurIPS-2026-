@@ -1,21 +1,16 @@
 # =============================================================================
-# Anonymous authors. Affiliations and acknowledgements will be added on
-# acceptance of the associated paper. Submitted to NeurIPS 2026 (double-blind).
+# Calibrated Safe Policy Improvement for Continuous Offline Reinforcement Learning
+# Federico Bianchi, Alessandro Farinelli, Alberto Castellini
+# NeurIPS 2026
 # =============================================================================
-"""
-td3bc.py — TD3+BC (Fujimoto & Gu, 2021)
-arXiv:2106.06860
+"""TD3+BC (Fujimoto & Gu, NeurIPS 2021, arXiv:2106.06860).
 
-Offline RL algorithm: TD3 with a behavioral cloning (BC) regularization
-term on the actor loss.
+TD3 with a behavioral cloning term on the actor:
+    L_actor = -lambda * Q1(s, pi(s)) + ||pi(s) - a||^2,  lambda = alpha_bc / mean|Q1|.
 
-Actor loss: L_actor = -Q(s, pi(s)) + lambda_bc * ||pi(s) - a_data||^2
-  where lambda_bc normalises the BC term by |Q|.
-
-Interface:
-  agent = TD3BCAgent(obs_dim, act_dim, cfg)
-  agent.train(dataset, n_epochs=100)
-  action = agent.act(obs_dict)
+    agent = TD3BCAgent(obs_dim, act_dim, cfg)
+    agent.train(dataset, n_epochs=100)
+    action = agent.act(obs)   # dict {"observation", "desired_goal"} or flat array
 """
 
 from __future__ import annotations
@@ -36,23 +31,24 @@ import torch.optim as optim
 
 @dataclass
 class TD3BCConfig:
+    """TD3+BC hyperparameters (defaults from the original paper)."""
+
     hidden_dim:  int   = 256
     n_hidden:    int   = 2
 
     lr:          float = 3e-4
     batch_size:  int   = 256
     gamma:       float = 0.99
-    tau:         float = 0.005   # soft target update
+    tau:         float = 0.005   # Polyak coefficient for target networks
 
-    # TD3 specific
-    policy_noise:   float = 0.2   # noise added to target actions
-    noise_clip:     float = 0.5   # clip target policy noise
+    # TD3
+    policy_noise:   float = 0.2   # std of target policy smoothing noise
+    noise_clip:     float = 0.5
     policy_freq:    int   = 2     # actor update every N critic updates
 
     # BC regularization
-    alpha_bc:    float = 2.5      # BC weight; per the paper default
+    alpha_bc:    float = 2.5
 
-    # State normalization (Fujimoto & Gu 2021: explicitly required for locomotion)
     normalize_states: bool  = True
 
     device: str = "cpu"
@@ -60,7 +56,7 @@ class TD3BCConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Networks (re-use the _mlp helper from iql, defined inline here for independence)
+# Networks
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _mlp(in_dim: int, out_dim: int, hidden_dim: int, n_hidden: int) -> nn.Sequential:
@@ -74,6 +70,7 @@ def _mlp(in_dim: int, out_dim: int, hidden_dim: int, n_hidden: int) -> nn.Sequen
 
 
 class TD3Actor(nn.Module):
+    """Deterministic actor with tanh output in [-1, 1]."""
     def __init__(self, state_dim: int, act_dim: int, hidden_dim: int, n_hidden: int):
         super().__init__()
         self.net = _mlp(state_dim, act_dim, hidden_dim, n_hidden)
@@ -94,6 +91,7 @@ class TD3Critic(nn.Module):
         return self.q1(sa).squeeze(-1), self.q2(sa).squeeze(-1)
 
     def q1_value(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """First Q head only (used in the actor loss)."""
         sa = torch.cat([s, a], dim=-1)
         return self.q1(sa).squeeze(-1)
 
@@ -103,10 +101,7 @@ class TD3Critic(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TD3BCAgent:
-    """
-    TD3+BC offline RL agent.
-    Works with PointMaze dict obs (goal-conditioned): s = concat(obs, goal).
-    """
+    """TD3+BC agent; dict observations map to concat(observation, desired_goal)."""
 
     def __init__(
         self,
@@ -139,7 +134,7 @@ class TD3BCAgent:
         self._train_step = 0
         self.loss_history: Dict[str, list] = {"critic": [], "actor": []}
 
-        # state normalization stats (set during train())
+        # Set in train() when cfg.normalize_states is True.
         self.state_mean: Optional[torch.Tensor] = None
         self.state_std:  Optional[torch.Tensor] = None
 
@@ -187,7 +182,10 @@ class TD3BCAgent:
 
     # ── training ──────────────────────────────────────────────────────────────
     def train(self, dataset: Dict[str, Any], n_epochs: int = 100) -> None:
-        """Train TD3+BC on offline dataset."""
+        """Train on an offline transition dict; each epoch is one critic step.
+
+        The actor and both targets are updated every cfg.policy_freq critic steps.
+        """
         S, A, R, S2, D = self._dataset_to_tensors(dataset)
         N = S.shape[0]
         if N == 0:
@@ -200,7 +198,6 @@ class TD3BCAgent:
 
         bs = min(self.cfg.batch_size, N)
 
-        # State normalization (Fujimoto & Gu 2021 Table 1: normalize_states=True)
         if self.cfg.normalize_states:
             self.state_mean = S.mean(0, keepdim=True)
             self.state_std  = S.std(0, keepdim=True).clamp(min=1e-3)
@@ -213,7 +210,7 @@ class TD3BCAgent:
             idx = rng.choice(N, size=bs, replace=(N < bs))
             s, a, r, s2, d = S[idx], A[idx], R[idx], S2[idx], D[idx]
 
-            # ── Critic update ──
+            # Critic: clipped double-Q target with target policy smoothing.
             with torch.no_grad():
                 noise = (torch.randn_like(a) * self.cfg.policy_noise
                          ).clamp(-self.cfg.noise_clip, self.cfg.noise_clip)
@@ -228,13 +225,13 @@ class TD3BCAgent:
             self.critic_opt.step()
             self.loss_history["critic"].append(float(critic_loss))
 
-            # ── Actor update (delayed) ──
+            # Delayed actor update.
             self._train_step += 1
             if self._train_step % self.cfg.policy_freq == 0:
                 pi = self.actor(s)
                 q1_pi = self.critic.q1_value(s, pi)
 
-                # normalised BC penalty
+                # Q term scaled by alpha_bc / mean|Q1| so it is comparable to the BC term.
                 lam = self.cfg.alpha_bc / (q1_pi.abs().mean().detach() + 1e-8)
                 bc_loss = F.mse_loss(pi, a)
                 actor_loss = -lam * q1_pi.mean() + bc_loss
@@ -250,7 +247,7 @@ class TD3BCAgent:
     # ── inference ─────────────────────────────────────────────────────────────
     @torch.no_grad()
     def act(self, obs: Any) -> np.ndarray:
-        """Return action ∈ [-1,1]^act_dim."""
+        """Return the deterministic action in [-1, 1]^act_dim."""
         s = torch.as_tensor(self._obs_to_state(obs), dtype=torch.float32,
                             device=self.device).unsqueeze(0)
         if self.state_mean is not None:
@@ -259,4 +256,5 @@ class TD3BCAgent:
         return np.clip(a, -1.0, 1.0).astype(np.float32)
 
     def __call__(self, obs: Any) -> np.ndarray:
+        """Alias for act()."""
         return self.act(obs)
